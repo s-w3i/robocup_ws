@@ -1,0 +1,11 @@
+string text
+---
+bool success
+string wav_path
+string message
+float32 synthesis_seconds
+float32 playback_seconds
+string device_used
+---
+string stage
+float32 progress

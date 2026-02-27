@@ -1,0 +1,8 @@
+uint64 track_id
+string class_name
+float32 detector_confidence
+float32 tracker_confidence
+geometry_msgs/PoseStamped pose_camera_link
+float32 depth_m
+string tf_child_frame
+bool valid_depth

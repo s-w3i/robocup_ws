@@ -1,0 +1,8 @@
+string text
+string out_path
+---
+bool success
+string wav_path
+string message
+float32 elapsed_seconds
+string device_used

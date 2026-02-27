@@ -1,0 +1,4 @@
+string class_name
+float32 confidence
+geometry_msgs/PoseStamped pose_camera_link
+string tf_child_frame

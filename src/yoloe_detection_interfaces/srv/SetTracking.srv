@@ -1,0 +1,8 @@
+bool enable
+bool save_image
+float32 rate_hz
+---
+bool success
+string message
+bool running
+string tracking_class

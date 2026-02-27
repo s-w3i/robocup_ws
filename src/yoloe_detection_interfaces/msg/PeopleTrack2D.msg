@@ -1,0 +1,9 @@
+uint64 track_id
+string class_name
+float32 detector_confidence
+float32 tracker_confidence
+int32 x
+int32 y
+int32 width
+int32 height
+bool reassociated

@@ -1,0 +1,13 @@
+string prompt_text
+bool save_image
+---
+bool success
+string message
+string[] detected_classes
+float32[] confidences
+geometry_msgs/PoseStamped[] poses_camera_link
+string[] tf_child_frames
+string saved_image_path
+int32 detections_in_frame
+int32 tf_published_count
+float32 inference_ms
