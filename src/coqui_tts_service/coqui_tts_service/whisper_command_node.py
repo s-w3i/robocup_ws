@@ -52,7 +52,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
-from std_msgs.msg import Bool, String
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
 from coqui_tts_interfaces.srv import RobotStatus
@@ -347,11 +347,10 @@ class WhisperCommandNode(Node):
         super().__init__("whisper_command_node")
 
         self.declare_parameter("status_topic", "/robot_status")
-        self.declare_parameter("awake_topic", "/awake")
         self.declare_parameter("status_service", "/robot_status")
         self.declare_parameter("get_command_service", "/get_command")
         self.declare_parameter("awake_word", "hi eva")
-        self.declare_parameter("get_command_timeout_sec", 12.0)
+        self.declare_parameter("get_command_timeout_sec", 10.0)
         self.declare_parameter("audio_device", "default")
         self.declare_parameter("rate", 16000)
         self.declare_parameter("frame_ms", 30)
@@ -375,7 +374,6 @@ class WhisperCommandNode(Node):
         self.declare_parameter("log_transcripts", True)
 
         self.status_topic = str(self.get_parameter("status_topic").value)
-        self.awake_topic = str(self.get_parameter("awake_topic").value)
         self.status_service = str(self.get_parameter("status_service").value)
         self.get_command_service = str(self.get_parameter("get_command_service").value)
         self.awake_word = str(self.get_parameter("awake_word").value).strip().lower()
@@ -423,7 +421,6 @@ class WhisperCommandNode(Node):
             self._robot_status_callback,
             status_qos,
         )
-        self._awake_pub = self.create_publisher(Bool, self.awake_topic, status_qos)
 
         self._status_client = self.create_client(RobotStatus, self.status_service)
         self._status_wait_warned = False
@@ -484,7 +481,7 @@ class WhisperCommandNode(Node):
 
         self.get_logger().info(
             f"Whisper command node ready. get_command={self.get_command_service} "
-            f"awake_word='{self.awake_word}' awake_topic={self.awake_topic}"
+            f"awake_word='{self.awake_word}'"
         )
         self.get_logger().info(
             f"extra_site_packages={self.extra_site_packages} isolate_site_packages={self.isolate_site_packages} "
@@ -578,11 +575,6 @@ class WhisperCommandNode(Node):
                 )
 
         future.add_done_callback(_done)
-
-    def _publish_awake(self, value: bool) -> None:
-        msg = Bool()
-        msg.data = bool(value)
-        self._awake_pub.publish(msg)
 
     def _should_listen(self) -> bool:
         with self._pending_lock:
@@ -728,7 +720,6 @@ class WhisperCommandNode(Node):
         if normalized_awake and normalized_awake in normalized_text:
             with self._status_lock:
                 self._wake_word_armed = False
-            self._publish_awake(True)
             self.get_logger().info(
                 f"Awake word '{self.awake_word}' detected. Requesting robot status 'idle'."
             )

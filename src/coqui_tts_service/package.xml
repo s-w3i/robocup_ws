@@ -11,6 +11,9 @@
   <depend>coqui_tts_interfaces</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
+  <exec_depend>python3-requests</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

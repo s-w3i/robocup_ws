@@ -85,11 +85,14 @@ class RobotStatusNode(Node):
             )
             return response
 
-        changed = target != self._status
+        previous_status = self._status
+        changed = target != previous_status
         self._status = target
         self._publish_status()
         if self._status == "sleep":
             self._publish_awake(False)
+        elif changed and previous_status == "sleep":
+            self._publish_awake(True)
 
         response.success = True
         response.status = self._status

@@ -47,15 +47,15 @@ prepend_site_packages(os.environ.get("COQUI_VENV_SITE_PACKAGES", DEFAULT_COQUI_S
 
 import numpy as np
 import rclpy
-from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 
 from coqui_tts_interfaces.action import SpeakText
-from coqui_tts_interfaces.srv import SynthesizeSpeech
+from coqui_tts_interfaces.srv import RobotStatus, SynthesizeSpeech
 
 
 class CuteFacePlayer:
@@ -178,7 +178,7 @@ class CuteFacePlayer:
                 self.height = max(480, int(display_h * 0.90))
 
             self._screen = self._pygame.display.set_mode((self.width, self.height), self._window_flags)
-            self._pygame.display.set_caption("EVA")
+            self._pygame.display.set_caption("AVA")
             self._text_font = self._pygame.font.SysFont(
                 "DejaVu Sans",
                 max(18, min(34, self.width // 22)),
@@ -663,6 +663,38 @@ class CuteFacePlayer:
                 if mouth_top_shadow.width > 0 and mouth_top_shadow.height > 0:
                     pg.draw.ellipse(screen, (83, 21, 30), mouth_top_shadow)
 
+        # Show wake-up hint while in sleep mode.
+        if not is_talking and idle_emotion == "sleepy":
+            hint_text = "Wake me up using 'Hi Ava'"
+            hint_lines = self._split_lines(
+                hint_text,
+                max_chars=max(18, self.width // 24),
+                max_lines=2,
+            )
+            if hint_lines:
+                rendered = [self._text_font.render(line, True, (236, 246, 255)) for line in hint_lines]
+                line_h = rendered[0].get_height()
+                box_w = max(surface.get_width() for surface in rendered) + 40
+                box_h = (line_h * len(rendered)) + (len(rendered) - 1) * 4 + 22
+                box_rect = pg.Rect(0, 0, box_w, box_h)
+                box_rect.centerx = center_x
+                box_rect.bottom = self.height - 22
+
+                pulse = 0.5 + 0.5 * math.sin(now_t * 1.4)
+                overlay = pg.Surface((self.width, self.height), pg.SRCALPHA)
+                panel_alpha = int(118 + 44 * pulse)
+                pg.draw.rect(overlay, (20, 40, 66, panel_alpha), box_rect, border_radius=14)
+                band = box_rect.inflate(0, -int(box_rect.height * 0.45))
+                band.height = max(8, box_rect.height // 3)
+                pg.draw.rect(overlay, (55, 92, 130, min(210, panel_alpha + 22)), band, border_radius=14)
+                screen.blit(overlay, (0, 0))
+
+                y = box_rect.y + 11
+                for surface in rendered:
+                    x = center_x - (surface.get_width() // 2)
+                    screen.blit(surface, (x, y))
+                    y += surface.get_height() + 4
+
         # Show transcript only while robot is speaking.
         if is_talking and text_preview:
             lines = self._split_lines(text_preview, max_chars=max(22, self.width // 22), max_lines=2)
@@ -858,6 +890,14 @@ class CoquiTalkingFaceActionNode(Node):
         self.declare_parameter("extra_site_packages", DEFAULT_COQUI_SITE_PACKAGES)
         self.declare_parameter("isolate_site_packages", True)
         self.declare_parameter("robot_status_topic", "/robot_status")
+        self.declare_parameter("robot_status_service", "/robot_status")
+        self.declare_parameter("awake_topic", "/awake")
+        self.declare_parameter("awake_greeting_done_topic", "/awake_greeting_done")
+        self.declare_parameter("awake_greeting_text", "Hi, what can I help you")
+        self.declare_parameter("speak_action_name", "/coqui_tts/speak")
+        self.declare_parameter("startup_ready_enabled", True)
+        self.declare_parameter("startup_ready_text", "I am ready")
+        self.declare_parameter("startup_ready_delay_sec", 0.8)
 
         self.tts_executable = self.get_parameter("tts_executable").get_parameter_value().string_value
         self.fixed_output_path = self.get_parameter("fixed_output_path").get_parameter_value().string_value
@@ -880,6 +920,26 @@ class CoquiTalkingFaceActionNode(Node):
             self.get_parameter("isolate_site_packages").get_parameter_value().bool_value
         )
         self.robot_status_topic = self.get_parameter("robot_status_topic").get_parameter_value().string_value
+        self.robot_status_service = (
+            self.get_parameter("robot_status_service").get_parameter_value().string_value
+        )
+        self.awake_topic = self.get_parameter("awake_topic").get_parameter_value().string_value
+        self.awake_greeting_done_topic = (
+            self.get_parameter("awake_greeting_done_topic").get_parameter_value().string_value
+        )
+        self.awake_greeting_text = (
+            self.get_parameter("awake_greeting_text").get_parameter_value().string_value
+        )
+        self.speak_action_name = self.get_parameter("speak_action_name").get_parameter_value().string_value
+        self.startup_ready_enabled = (
+            self.get_parameter("startup_ready_enabled").get_parameter_value().bool_value
+        )
+        self.startup_ready_text = (
+            self.get_parameter("startup_ready_text").get_parameter_value().string_value
+        )
+        self.startup_ready_delay_sec = (
+            self.get_parameter("startup_ready_delay_sec").get_parameter_value().double_value
+        )
         added, removed = activate_coqui_site_packages(
             self.extra_site_packages, self.isolate_site_packages
         )
@@ -908,6 +968,17 @@ class CoquiTalkingFaceActionNode(Node):
             self._robot_status_callback,
             status_qos,
         )
+        self._awake_sub = self.create_subscription(
+            Bool,
+            self.awake_topic,
+            self._awake_callback,
+            status_qos,
+        )
+        self._awake_greeting_done_pub = self.create_publisher(
+            Bool,
+            self.awake_greeting_done_topic,
+            status_qos,
+        )
         self.face_player.set_robot_status(self._robot_status)
 
         self.tts_engine = None
@@ -921,11 +992,21 @@ class CoquiTalkingFaceActionNode(Node):
         self._action_server = ActionServer(
             self,
             SpeakText,
-            "/coqui_tts/speak",
+            self.speak_action_name,
             execute_callback=self.execute_callback,
             goal_callback=self.goal_callback,
             cancel_callback=self.cancel_callback,
             callback_group=self._callback_group,
+        )
+        self._speak_action_client = ActionClient(
+            self,
+            SpeakText,
+            self.speak_action_name,
+            callback_group=self._callback_group,
+        )
+        self._robot_status_client = self.create_client(
+            RobotStatus,
+            self.robot_status_service,
         )
         self.create_service(
             SynthesizeSpeech,
@@ -933,7 +1014,9 @@ class CoquiTalkingFaceActionNode(Node):
             self.handle_synthesize_request,
         )
 
-        self.get_logger().info("Coqui talking-face action ready on /coqui_tts/speak")
+        self.get_logger().info(
+            f"Coqui talking-face action ready on {self.speak_action_name}"
+        )
         self.get_logger().info("Coqui TTS service ready on /coqui_tts/synthesize")
         self.get_logger().info(f"Fixed output path: {self.fixed_output_path}")
         self.get_logger().info(f"Resolved device: {self.requested_device}")
@@ -947,6 +1030,23 @@ class CoquiTalkingFaceActionNode(Node):
             f"(added={added}, removed={removed})"
         )
         self.get_logger().info(f"Robot status topic: {self.robot_status_topic}")
+        self.get_logger().info(
+            f"Awake topic: {self.awake_topic} | greeting='{self.awake_greeting_text}'"
+        )
+        self.get_logger().info(
+            f"Awake greeting done topic: {self.awake_greeting_done_topic}"
+        )
+
+        self._startup_ready_timer = None
+        if self.startup_ready_enabled and self.startup_ready_text.strip():
+            delay_sec = max(0.1, float(self.startup_ready_delay_sec))
+            self._startup_ready_timer = self.create_timer(
+                delay_sec,
+                self._startup_ready_timer_callback,
+            )
+            self.get_logger().info(
+                f"Startup ready announcement scheduled in {delay_sec:.1f}s."
+            )
 
     def _robot_status_callback(self, msg: String) -> None:
         status = str(msg.data).strip().lower()
@@ -961,6 +1061,169 @@ class CoquiTalkingFaceActionNode(Node):
         if changed:
             self._robot_status = status
             self.get_logger().info(f"Robot status changed to '{status}'.")
+
+    def _awake_callback(self, msg: Bool) -> None:
+        if not bool(msg.data):
+            return
+
+        greeting = self.awake_greeting_text.strip()
+        if not greeting:
+            self.get_logger().warn("awake_greeting_text is empty; skipping awake greeting.")
+            return
+
+        if not self._speak_action_client.wait_for_server(timeout_sec=0.5):
+            self.get_logger().warn(
+                f"Speak action server '{self.speak_action_name}' is not ready; cannot send awake greeting."
+            )
+            self._publish_awake_greeting_done(False)
+            return
+
+        goal = SpeakText.Goal()
+        goal.text = greeting
+        self._publish_awake_greeting_done(False)
+        self.get_logger().info("Received /awake=true, sending SpeakText greeting action goal.")
+        send_goal_future = self._speak_action_client.send_goal_async(goal)
+        send_goal_future.add_done_callback(self._on_awake_goal_response)
+
+    def _publish_awake_greeting_done(self, value: bool) -> None:
+        msg = Bool()
+        msg.data = bool(value)
+        self._awake_greeting_done_pub.publish(msg)
+
+    def _startup_ready_timer_callback(self) -> None:
+        if self._startup_ready_timer is not None:
+            self._startup_ready_timer.cancel()
+            self._startup_ready_timer = None
+
+        ready_text = self.startup_ready_text.strip()
+        if not ready_text:
+            return
+
+        if not self._speak_action_client.wait_for_server(timeout_sec=0.8):
+            self.get_logger().warn(
+                f"Speak action server '{self.speak_action_name}' is not ready; "
+                "retrying startup ready announcement."
+            )
+            self._startup_ready_timer = self.create_timer(
+                1.0,
+                self._startup_ready_timer_callback,
+            )
+            return
+
+        goal = SpeakText.Goal()
+        goal.text = ready_text
+        self.get_logger().info(
+            f"Sending startup SpeakText action goal: '{ready_text}'."
+        )
+        send_goal_future = self._speak_action_client.send_goal_async(goal)
+        send_goal_future.add_done_callback(self._on_startup_ready_goal_response)
+
+    def _on_startup_ready_goal_response(self, future) -> None:
+        try:
+            goal_handle = future.result()
+        except Exception as exc:
+            self.get_logger().error(f"Failed to send startup ready goal: {exc}")
+            return
+
+        if not goal_handle.accepted:
+            self.get_logger().warn("Startup ready goal rejected.")
+            return
+
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._on_startup_ready_goal_result)
+
+    def _on_startup_ready_goal_result(self, future) -> None:
+        try:
+            result_wrap = future.result()
+        except Exception as exc:
+            self.get_logger().error(f"Startup ready action failed: {exc}")
+            return
+
+        result = result_wrap.result
+        if result.success:
+            self.get_logger().info(
+                "Startup ready action completed. Requesting robot status 'sleep'."
+            )
+            self.get_logger().info("VOICE_STACK_READY")
+            self._set_robot_status_async("sleep")
+        else:
+            self.get_logger().warn(
+                f"Startup ready action did not succeed: {result.message}"
+            )
+
+    def _set_robot_status_async(self, target: str) -> None:
+        target = str(target).strip().lower()
+        if target not in ("sleep", "listening", "idle", "operating"):
+            return
+
+        if not self._robot_status_client.wait_for_service(timeout_sec=0.5):
+            self.get_logger().warn(
+                f"Robot status service '{self.robot_status_service}' not ready; "
+                f"cannot set '{target}'."
+            )
+            return
+
+        req = RobotStatus.Request()
+        req.status = target
+        future = self._robot_status_client.call_async(req)
+        future.add_done_callback(
+            lambda fut: self._on_robot_status_set_done(fut, target)
+        )
+
+    def _on_robot_status_set_done(self, future, target: str) -> None:
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.get_logger().error(
+                f"Robot status request '{target}' failed: {exc}"
+            )
+            return
+
+        if response is None:
+            self.get_logger().error(
+                f"Robot status request '{target}' returned no response."
+            )
+            return
+
+        if response.success:
+            self.get_logger().info(
+                f"Robot status service set '{target}' successfully "
+                f"(reported='{response.status}')."
+            )
+        else:
+            self.get_logger().warn(
+                f"Robot status service rejected '{target}': {response.message}"
+            )
+
+    def _on_awake_goal_response(self, future) -> None:
+        try:
+            goal_handle = future.result()
+        except Exception as exc:
+            self.get_logger().error(f"Failed to send awake greeting goal: {exc}")
+            return
+
+        if not goal_handle.accepted:
+            self.get_logger().warn("Awake greeting goal rejected.")
+            self._publish_awake_greeting_done(False)
+            return
+
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._on_awake_goal_result)
+
+    def _on_awake_goal_result(self, future) -> None:
+        try:
+            result_wrap = future.result()
+        except Exception as exc:
+            self.get_logger().error(f"Awake greeting action failed: {exc}")
+            return
+
+        result = result_wrap.result
+        if result.success:
+            self._publish_awake_greeting_done(True)
+            self.get_logger().info("Awake greeting action completed.")
+        else:
+            self._publish_awake_greeting_done(False)
+            self.get_logger().warn(f"Awake greeting action did not succeed: {result.message}")
 
     def _build_runtime_env(self) -> None:
         lib_paths = []

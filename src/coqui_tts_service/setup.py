@@ -1,3 +1,5 @@
+from glob import glob
+
 from setuptools import setup
 
 package_name = 'coqui_tts_service'
@@ -9,8 +11,9 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
     ],
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'requests'],
     zip_safe=True,
     maintainer='usern',
     maintainer_email='usern@local',
@@ -23,6 +26,7 @@ setup(
             'coqui_talking_face_action_node = coqui_tts_service.coqui_talking_face_action_node:main',
             'robot_status_node = coqui_tts_service.robot_status_node:main',
             'whisper_command_node = coqui_tts_service.whisper_command_node:main',
+            'ollama_chatbot_node = coqui_tts_service.ollama_chatbot_node:main',
         ],
     },
 )

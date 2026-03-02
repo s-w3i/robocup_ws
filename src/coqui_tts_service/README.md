@@ -5,15 +5,18 @@ ROS2 Coqui TTS nodes:
 - Unified talking-face node:
   - Service: `/coqui_tts/synthesize` (`coqui_tts_interfaces/srv/SynthesizeSpeech`)
   - Action: `/coqui_tts/speak` (`coqui_tts_interfaces/action/SpeakText`)
+  - Subscribes: `/awake` (`std_msgs/msg/Bool`) and sends a `SpeakText` greeting goal when `true`
+  - On startup, can auto-speak `"I am ready"` and then request `/robot_status` -> `sleep`
 - Robot status node:
   - Service: `/robot_status` (`coqui_tts_interfaces/srv/RobotStatus`)
   - Topic: `/robot_status` (`std_msgs/msg/String`)
-  - Topic: `/awake` (`std_msgs/msg/Bool`) publishes `false` when status is set to `sleep`
+  - Topic: `/awake` (`std_msgs/msg/Bool`) publishes:
+    - `false` when status is set to `sleep`
+    - `true` only when `/robot_status` service changes status from `sleep` to non-sleep
   - Default status: `sleep`
 - Whisper command node:
   - Service: `/get_command` (`std_srvs/srv/Trigger`)
   - Subscribes: `/robot_status` (`std_msgs/msg/String`)
-  - Publishes: `/awake` (`std_msgs/msg/Bool`) as `true` when awake-word is detected
   - Transcription language is fixed to English (`en`)
   - Wake-word mode only when robot status is `sleep`
   - On wake word (`hi eva` by default): requests robot status `idle`
@@ -84,6 +87,13 @@ Run whisper command node:
 ```bash
 source /home/usern/robocup_ws/install/setup.bash
 ros2 run coqui_tts_service whisper_command_node
+```
+
+Run full voice interaction stack:
+
+```bash
+source /home/usern/robocup_ws/install/setup.bash
+ros2 launch coqui_tts_service voice_interaction_stack.launch.py
 ```
 
 Override wake word / service timeout:
