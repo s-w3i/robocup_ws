@@ -51,17 +51,27 @@ from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
+from std_msgs.msg import String
 
 from coqui_tts_interfaces.action import SpeakText
 from coqui_tts_interfaces.srv import SynthesizeSpeech
 
 
 class CuteFacePlayer:
-    def __init__(self, logger, width: int, height: int, fps: int) -> None:
+    def __init__(
+        self,
+        logger,
+        width: int,
+        height: int,
+        fps: int,
+        emotion_speed_scale: float = 1.0,
+    ) -> None:
         self._logger = logger
         self.width = max(640, int(width))
         self.height = max(480, int(height))
-        self.fps = max(10, fps)
+        self.fps = max(60, fps)
+        self._emotion_speed_scale = max(0.1, float(emotion_speed_scale))
         self._window_flags = 0
 
         self._pygame = None
@@ -79,11 +89,15 @@ class CuteFacePlayer:
         self._mouth_target = 0.12
         self._mouth_display = 0.12
         self._is_talking = False
-        self._idle_emotion = "neutral"
-        self._idle_emotion_until = time.perf_counter() + random.uniform(1.8, 3.2)
+        self._robot_status = "sleep"
+        self._idle_emotion = "sleepy"
+        self._idle_emotion_until = float("inf")
         self._text_preview = ""
         self._next_blink = time.perf_counter() + random.uniform(1.2, 2.8)
         self._blink_end = 0.0
+
+    def _scale_interval(self, seconds: float, min_seconds: float = 0.1) -> float:
+        return max(min_seconds, float(seconds) / self._emotion_speed_scale)
 
     @staticmethod
     def _sanitize_text(text: str) -> str:
@@ -164,7 +178,7 @@ class CuteFacePlayer:
                 self.height = max(480, int(display_h * 0.90))
 
             self._screen = self._pygame.display.set_mode((self.width, self.height), self._window_flags)
-            self._pygame.display.set_caption("Robot Face")
+            self._pygame.display.set_caption("EVA")
             self._text_font = self._pygame.font.SysFont(
                 "DejaVu Sans",
                 max(18, min(34, self.width // 22)),
@@ -202,11 +216,41 @@ class CuteFacePlayer:
         with self._state_lock:
             self._mouth_target = 0.12
             self._is_talking = False
-            self._idle_emotion_until = min(
-                self._idle_emotion_until,
-                time.perf_counter() + random.uniform(0.4, 1.1),
-            )
+            now = time.perf_counter()
+            if self._robot_status in ("idle", "operating"):
+                self._idle_emotion_until = min(
+                    self._idle_emotion_until,
+                    now + self._scale_interval(random.uniform(0.4, 1.1), min_seconds=0.08),
+                )
+            else:
+                self._idle_emotion_until = now
+            self._apply_robot_status_locked(now)
             self._text_preview = self._sanitize_text(text)
+
+    def set_robot_status(self, status: str) -> bool:
+        normalized = status.strip().lower()
+        if normalized not in ("sleep", "listening", "idle", "operating"):
+            return False
+        with self._state_lock:
+            if self._robot_status == normalized:
+                return False
+            self._robot_status = normalized
+            now = time.perf_counter()
+            self._idle_emotion_until = now
+            self._apply_robot_status_locked(now)
+        return True
+
+    def _apply_robot_status_locked(self, now: float) -> None:
+        if self._robot_status == "sleep":
+            self._idle_emotion = "sleepy"
+            self._idle_emotion_until = float("inf")
+            return
+        if self._robot_status == "listening":
+            self._idle_emotion = "listening"
+            self._idle_emotion_until = float("inf")
+            return
+        if now >= self._idle_emotion_until:
+            self._choose_next_idle_emotion_locked(now)
 
     def _set_speaking_mouth(self, text: str, mouth_open: float) -> None:
         with self._state_lock:
@@ -220,7 +264,6 @@ class CuteFacePlayer:
             "smile_big",
             "happy_open",
             "surprised",
-            "sleepy",
             "wink_left",
             "wink_right",
         ]
@@ -232,12 +275,11 @@ class CuteFacePlayer:
             "smile_big": 2.2,
             "happy_open": 1.7,
             "surprised": 1.2,
-            "sleepy": 2.5,
             "wink_left": 0.85,
             "wink_right": 0.85,
         }
         duration = duration_map.get(self._idle_emotion, 2.0) + random.uniform(-0.25, 0.45)
-        self._idle_emotion_until = now + max(0.65, duration)
+        self._idle_emotion_until = now + self._scale_interval(duration, min_seconds=0.25)
 
     def _extract_envelope(self, wav_path: str) -> Tuple[List[float], float]:
         try:
@@ -331,6 +373,7 @@ class CuteFacePlayer:
         screen = self._screen
         center_x = self.width // 2
         center_y = self.height // 2
+        now_t = time.perf_counter()
 
         # Flat Kirby-like face background with subtle polish.
         base_color = (231, 169, 176)
@@ -362,11 +405,19 @@ class CuteFacePlayer:
         eye_offset = int(self.width * 0.18)
         eye_w = max(54, int(self.width * 0.14))
         eye_h = max(110, int(self.height * 0.34))
+        sleep_breathe_offset = 0
 
         mood = idle_emotion if not is_talking else "talking"
         if mood == "sleepy":
             eye_h = max(72, int(eye_h * 0.68))
             eye_y += int(self.height * 0.02)
+            sleep_breathe_offset = int(self.height * 0.008 * math.sin(now_t * 1.2))
+        elif mood == "listening":
+            eye_h = max(82, int(eye_h * 0.86))
+            eye_w = max(48, int(eye_w * 0.94))
+            eye_y -= int(self.height * 0.01)
+            # Listening mode: subtle micro motion makes the status easier to recognize.
+            eye_y += int(self.height * 0.004 * math.sin(now_t * 4.2))
         elif mood == "surprised":
             eye_h = int(eye_h * 1.12)
             eye_w = int(eye_w * 0.95)
@@ -379,6 +430,12 @@ class CuteFacePlayer:
                 (x_center + width_px // 2, y_center),
                 9,
             )
+
+        def draw_sleep_eye(x_center: int, y_center: int, width_px: int, height_px: int) -> None:
+            curve_h = max(14, int(height_px * 0.16))
+            eye_rect = pg.Rect(0, 0, width_px, curve_h)
+            eye_rect.center = (x_center, y_center + max(2, curve_h // 4))
+            pg.draw.arc(screen, (20, 20, 24), eye_rect, 0.08 * math.pi, 0.92 * math.pi, 8)
 
         def draw_open_eye(x_center: int, y_center: int, width_px: int, height_px: int) -> None:
             eye_rect = pg.Rect(0, 0, width_px, height_px)
@@ -412,7 +469,10 @@ class CuteFacePlayer:
 
         left_x = center_x - eye_offset
         right_x = center_x + eye_offset
-        if mood == "wink_left":
+        if mood == "sleepy":
+            draw_sleep_eye(left_x, eye_y + sleep_breathe_offset, eye_w, eye_h)
+            draw_sleep_eye(right_x, eye_y + sleep_breathe_offset, eye_w, eye_h)
+        elif mood == "wink_left":
             draw_closed_eye(left_x, eye_y, eye_w)
             draw_open_eye(right_x, eye_y, eye_w, eye_h)
         elif mood == "wink_right":
@@ -425,11 +485,117 @@ class CuteFacePlayer:
             draw_open_eye(left_x, eye_y, eye_w, eye_h)
             draw_open_eye(right_x, eye_y, eye_w, eye_h)
 
+        if mood == "listening":
+            listen_overlay = pg.Surface((self.width, self.height), pg.SRCALPHA)
+            pulse = 0.5 + 0.5 * math.sin(now_t * 3.0)
+            forehead_x = center_x
+            forehead_y = center_y - int(self.height * 0.30)
+            glow_w = max(90, int(self.width * (0.19 + 0.03 * pulse)))
+            glow_h = max(48, int(self.height * (0.09 + 0.02 * pulse)))
+            glow_rect = pg.Rect(0, 0, glow_w, glow_h)
+            glow_rect.center = (forehead_x, forehead_y)
+            pg.draw.ellipse(listen_overlay, (84, 144, 220, int(46 + 48 * pulse)), glow_rect)
+            halo_rect = glow_rect.inflate(max(16, glow_w // 3), max(12, glow_h // 2))
+            pg.draw.ellipse(
+                listen_overlay,
+                (150, 208, 255, int(26 + 34 * pulse)),
+                halo_rect,
+                width=max(2, int(self.width * 0.003)),
+            )
+            screen.blit(listen_overlay, (0, 0))
+
+            ring_inner = max(14, int(self.width * 0.018))
+            ring_outer = max(22, int(self.width * 0.028))
+            ring_width = max(3, int(self.width * 0.003))
+            ring_color = (24, 84, 152)
+            ring_highlight = (116, 170, 226)
+            ear_offset = int(self.width * 0.31)
+            ear_y = eye_y + int(self.height * 0.01)
+            for side in (-1, 1):
+                ear_x = center_x + (side * ear_offset)
+                pg.draw.circle(screen, ring_color, (ear_x, ear_y), ring_inner, ring_width)
+                pg.draw.circle(screen, ring_highlight, (ear_x, ear_y), ring_outer, ring_width)
+                for idx in range(4):
+                    phase = (now_t * 0.65 + idx * 0.23) % 1.0
+                    radius = max(ring_outer + 2, ring_outer + int(self.width * (0.02 + 0.10 * phase)))
+                    alpha = int(170 * (1.0 - phase))
+                    wave = pg.Surface((self.width, self.height), pg.SRCALPHA)
+                    pg.draw.circle(
+                        wave,
+                        (112, 176, 245, alpha),
+                        (ear_x, ear_y),
+                        radius,
+                        max(2, ring_width - 1),
+                    )
+                    screen.blit(wave, (0, 0))
+
+            # Animated listening bars on forehead for a clear "audio input" cue.
+            bars_color = (42, 102, 176)
+            bars_glow = (150, 208, 255)
+            bar_w = max(7, int(self.width * 0.009))
+            bar_gap = max(6, int(self.width * 0.006))
+            bar_count = 5
+            base_y = forehead_y + int(self.height * 0.09)
+            total_w = (bar_count * bar_w) + ((bar_count - 1) * bar_gap)
+            start_x = center_x - (total_w // 2)
+            for idx in range(bar_count):
+                osc = 0.5 + 0.5 * math.sin((now_t * 7.0) + idx * 0.9)
+                bar_h = max(12, int(self.height * (0.028 + 0.05 * osc)))
+                rect = pg.Rect(
+                    start_x + idx * (bar_w + bar_gap),
+                    base_y - bar_h,
+                    bar_w,
+                    bar_h,
+                )
+                pg.draw.rect(screen, bars_color, rect, border_radius=max(3, bar_w // 2))
+                glow_rect = rect.inflate(max(2, bar_w // 3), max(2, bar_w // 4))
+                pg.draw.rect(screen, bars_glow, glow_rect, width=1, border_radius=max(3, bar_w // 2))
+
+        if mood == "sleepy":
+            sleep_overlay = pg.Surface((self.width, self.height), pg.SRCALPHA)
+            breathe = 0.5 + 0.5 * math.sin(now_t * 1.2)
+            bubble_x = center_x + int(self.width * 0.13)
+            bubble_y = center_y + int(self.height * 0.02) + sleep_breathe_offset
+            bubble_r = max(10, int(self.width * (0.013 + 0.010 * breathe)))
+            pg.draw.circle(sleep_overlay, (220, 241, 255, 180), (bubble_x, bubble_y), bubble_r)
+            highlight_r = max(3, bubble_r // 3)
+            pg.draw.circle(
+                sleep_overlay,
+                (255, 255, 255, 190),
+                (bubble_x - max(3, bubble_r // 4), bubble_y - max(2, bubble_r // 4)),
+                highlight_r,
+            )
+            for idx in range(3):
+                phase = (now_t * 0.22 + idx * 0.34) % 1.0
+                alpha = int(60 + (140 * (1.0 - phase)))
+                z_w = max(10, int(self.width * (0.011 + 0.004 * (1.0 - phase))))
+                z_h = max(12, int(self.height * (0.022 + 0.006 * (1.0 - phase))))
+                z_x = bubble_x + int(self.width * (0.04 + idx * 0.03))
+                z_y = bubble_y - int(self.height * (0.10 + idx * 0.05 + phase * 0.18))
+                z_color = (96, 136, 180, alpha)
+                stroke = max(2, int(self.width * 0.0025))
+                pg.draw.line(sleep_overlay, z_color, (z_x, z_y), (z_x + z_w, z_y), stroke)
+                pg.draw.line(
+                    sleep_overlay,
+                    z_color,
+                    (z_x + z_w, z_y),
+                    (z_x, z_y + z_h),
+                    stroke,
+                )
+                pg.draw.line(
+                    sleep_overlay,
+                    z_color,
+                    (z_x, z_y + z_h),
+                    (z_x + z_w, z_y + z_h),
+                    stroke,
+                )
+            screen.blit(sleep_overlay, (0, 0))
+
         # Cheeks.
         cheek_color = (226, 73, 104)
         cheek_w = int(self.width * 0.13)
         cheek_h = int(self.height * 0.085)
-        cheek_y = center_y + int(self.height * 0.14)
+        cheek_y = center_y + int(self.height * 0.14) + sleep_breathe_offset
         cheek_offset = int(self.width * 0.27)
         left_cheek = pg.Rect(0, 0, cheek_w, cheek_h)
         right_cheek = pg.Rect(0, 0, cheek_w, cheek_h)
@@ -442,7 +608,7 @@ class CuteFacePlayer:
         pg.draw.ellipse(screen, (241, 104, 132), left_cheek_shine)
         pg.draw.ellipse(screen, (241, 104, 132), right_cheek_shine)
 
-        mouth_center_y = center_y + int(self.height * 0.21)
+        mouth_center_y = center_y + int(self.height * 0.21) + sleep_breathe_offset
         if is_talking:
             mouth_norm = max(0.0, min(1.0, (mouth_open - 0.12) / 0.88))
         else:
@@ -452,6 +618,7 @@ class CuteFacePlayer:
                 "happy_open": 0.38,
                 "surprised": 0.72,
                 "sleepy": 0.05,
+                "listening": 0.08,
                 "wink_left": 0.16,
                 "wink_right": 0.16,
             }.get(idle_emotion, 0.10)
@@ -553,8 +720,8 @@ class CuteFacePlayer:
                 blinking = now <= self._blink_end
 
                 with self._state_lock:
-                    if not self._is_talking and now >= self._idle_emotion_until:
-                        self._choose_next_idle_emotion_locked(now)
+                    if not self._is_talking:
+                        self._apply_robot_status_locked(now)
                     mouth_target = self._mouth_target
                     is_talking = self._is_talking
                     idle_emotion = self._idle_emotion
@@ -687,8 +854,10 @@ class CoquiTalkingFaceActionNode(Node):
         self.declare_parameter("face_width", 1280)
         self.declare_parameter("face_height", 720)
         self.declare_parameter("face_fps", 30)
+        self.declare_parameter("face_emotion_speed_scale", 0.8)
         self.declare_parameter("extra_site_packages", DEFAULT_COQUI_SITE_PACKAGES)
         self.declare_parameter("isolate_site_packages", True)
+        self.declare_parameter("robot_status_topic", "/robot_status")
 
         self.tts_executable = self.get_parameter("tts_executable").get_parameter_value().string_value
         self.fixed_output_path = self.get_parameter("fixed_output_path").get_parameter_value().string_value
@@ -703,10 +872,14 @@ class CoquiTalkingFaceActionNode(Node):
         self.face_width = self.get_parameter("face_width").get_parameter_value().integer_value
         self.face_height = self.get_parameter("face_height").get_parameter_value().integer_value
         self.face_fps = self.get_parameter("face_fps").get_parameter_value().integer_value
+        self.face_emotion_speed_scale = (
+            self.get_parameter("face_emotion_speed_scale").get_parameter_value().double_value
+        )
         self.extra_site_packages = self.get_parameter("extra_site_packages").get_parameter_value().string_value
         self.isolate_site_packages = (
             self.get_parameter("isolate_site_packages").get_parameter_value().bool_value
         )
+        self.robot_status_topic = self.get_parameter("robot_status_topic").get_parameter_value().string_value
         added, removed = activate_coqui_site_packages(
             self.extra_site_packages, self.isolate_site_packages
         )
@@ -721,9 +894,21 @@ class CoquiTalkingFaceActionNode(Node):
             width=self.face_width,
             height=self.face_height,
             fps=self.face_fps,
+            emotion_speed_scale=self.face_emotion_speed_scale,
         )
         self.face_player.start(wait_for_ui=True, timeout_sec=4.0)
         self.face_player.set_idle("")
+        self._robot_status = "sleep"
+        status_qos = QoSProfile(depth=1)
+        status_qos.reliability = QoSReliabilityPolicy.RELIABLE
+        status_qos.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
+        self._robot_status_sub = self.create_subscription(
+            String,
+            self.robot_status_topic,
+            self._robot_status_callback,
+            status_qos,
+        )
+        self.face_player.set_robot_status(self._robot_status)
 
         self.tts_engine = None
         self.engine_error = ""
@@ -753,11 +938,29 @@ class CoquiTalkingFaceActionNode(Node):
         self.get_logger().info(f"Fixed output path: {self.fixed_output_path}")
         self.get_logger().info(f"Resolved device: {self.requested_device}")
         self.get_logger().info(f"Model: {self.model_name}")
+        self.get_logger().info(
+            f"face_emotion_speed_scale: {self.face_emotion_speed_scale}"
+        )
         self.get_logger().info(f"extra_site_packages: {self.extra_site_packages}")
         self.get_logger().info(
             f"isolate_site_packages: {self.isolate_site_packages} "
             f"(added={added}, removed={removed})"
         )
+        self.get_logger().info(f"Robot status topic: {self.robot_status_topic}")
+
+    def _robot_status_callback(self, msg: String) -> None:
+        status = str(msg.data).strip().lower()
+        if status not in ("sleep", "listening", "idle", "operating"):
+            self.get_logger().warn(
+                f"Ignoring invalid robot status '{status}' on {self.robot_status_topic}."
+            )
+            return
+        if status == self._robot_status:
+            return
+        changed = self.face_player.set_robot_status(status)
+        if changed:
+            self._robot_status = status
+            self.get_logger().info(f"Robot status changed to '{status}'.")
 
     def _build_runtime_env(self) -> None:
         lib_paths = []

@@ -21,6 +21,8 @@ setup(
         'console_scripts': [
             'coqui_tts_service_node = coqui_tts_service.coqui_tts_service_node:main',
             'coqui_talking_face_action_node = coqui_tts_service.coqui_talking_face_action_node:main',
+            'robot_status_node = coqui_tts_service.robot_status_node:main',
+            'whisper_command_node = coqui_tts_service.whisper_command_node:main',
         ],
     },
 )
