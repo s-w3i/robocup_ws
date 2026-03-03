@@ -89,6 +89,7 @@ class CuteFacePlayer:
         self._mouth_target = 0.12
         self._mouth_display = 0.12
         self._is_talking = False
+        self._subtitle_progress = 0.0
         self._robot_status = "sleep"
         self._idle_emotion = "sleepy"
         self._idle_emotion_until = float("inf")
@@ -101,8 +102,7 @@ class CuteFacePlayer:
 
     @staticmethod
     def _sanitize_text(text: str) -> str:
-        cleaned = " ".join(text.split()).strip()
-        return cleaned[:140]
+        return " ".join(text.split()).strip()
 
     def _ensure_ready(self) -> bool:
         if self._ready:
@@ -216,6 +216,7 @@ class CuteFacePlayer:
         with self._state_lock:
             self._mouth_target = 0.12
             self._is_talking = False
+            self._subtitle_progress = 0.0
             now = time.perf_counter()
             if self._robot_status in ("idle", "operating"):
                 self._idle_emotion_until = min(
@@ -252,9 +253,12 @@ class CuteFacePlayer:
         if now >= self._idle_emotion_until:
             self._choose_next_idle_emotion_locked(now)
 
-    def _set_speaking_mouth(self, text: str, mouth_open: float) -> None:
+    def _set_speaking_mouth(
+        self, text: str, mouth_open: float, subtitle_progress: float = 0.0
+    ) -> None:
         with self._state_lock:
             self._is_talking = True
+            self._subtitle_progress = float(max(0.0, min(1.0, subtitle_progress)))
             self._text_preview = self._sanitize_text(text)
             self._mouth_target = float(max(0.12, min(1.0, mouth_open)))
 
@@ -358,6 +362,61 @@ class CuteFacePlayer:
 
         return lines[:max_lines]
 
+    @staticmethod
+    def _wrap_lines_full(text: str, max_chars: int) -> List[str]:
+        words = text.split()
+        if not words:
+            return []
+
+        lines = []
+        current = ""
+        for word in words:
+            if len(word) > max_chars:
+                if current:
+                    lines.append(current)
+                    current = ""
+                start = 0
+                while start < len(word):
+                    chunk = word[start : start + max_chars]
+                    if len(chunk) == max_chars:
+                        lines.append(chunk)
+                    else:
+                        current = chunk
+                    start += max_chars
+                continue
+            candidate = f"{current} {word}".strip()
+            if current and len(candidate) > max_chars:
+                lines.append(current)
+                current = word
+                continue
+            current = candidate
+        if current:
+            lines.append(current)
+        return lines
+
+    def _subtitle_page_for_progress(
+        self,
+        text: str,
+        progress: float,
+        max_chars: int,
+        max_lines: int = 2,
+    ) -> List[str]:
+        lines = self._wrap_lines_full(text, max_chars=max_chars)
+        if not lines:
+            return []
+
+        page_size = max(1, int(max_lines))
+        pages = [lines[i : i + page_size] for i in range(0, len(lines), page_size)]
+        if not pages:
+            return []
+
+        clamped = max(0.0, min(1.0, float(progress)))
+        if clamped >= 0.999:
+            idx = len(pages) - 1
+        else:
+            idx = min(len(pages) - 1, int(clamped * len(pages)))
+        return pages[idx]
+
     def _draw_face(
         self,
         mouth_open: float,
@@ -365,6 +424,7 @@ class CuteFacePlayer:
         is_talking: bool,
         idle_emotion: str,
         text_preview: str,
+        subtitle_progress: float,
     ) -> None:
         if not self._display_ready:
             return
@@ -697,7 +757,12 @@ class CuteFacePlayer:
 
         # Show transcript only while robot is speaking.
         if is_talking and text_preview:
-            lines = self._split_lines(text_preview, max_chars=max(22, self.width // 22), max_lines=2)
+            lines = self._subtitle_page_for_progress(
+                text_preview,
+                progress=subtitle_progress,
+                max_chars=max(22, self.width // 22),
+                max_lines=2,
+            )
             if lines:
                 rendered = [self._text_font.render(line, True, (255, 255, 255)) for line in lines]
                 line_h = rendered[0].get_height()
@@ -756,11 +821,19 @@ class CuteFacePlayer:
                         self._apply_robot_status_locked(now)
                     mouth_target = self._mouth_target
                     is_talking = self._is_talking
+                    subtitle_progress = self._subtitle_progress
                     idle_emotion = self._idle_emotion
                     text_preview = self._text_preview
 
                 self._mouth_display = (0.68 * self._mouth_display) + (0.32 * mouth_target)
-                self._draw_face(self._mouth_display, blinking, is_talking, idle_emotion, text_preview)
+                self._draw_face(
+                    self._mouth_display,
+                    blinking,
+                    is_talking,
+                    idle_emotion,
+                    text_preview,
+                    subtitle_progress,
+                )
             except Exception as exc:
                 self._ui_failed = True
                 self._display_ready = False
@@ -780,7 +853,7 @@ class CuteFacePlayer:
         feedback_cb: Callable[[str, float], None],
     ) -> Tuple[bool, float, str]:
         envelope, duration = self._extract_envelope(wav_path)
-        self._set_speaking_mouth(text, 0.16)
+        self._set_speaking_mouth(text, 0.16, 0.0)
         start_time = time.perf_counter()
         try:
             process = subprocess.Popen(  # pylint: disable=consider-using-with
@@ -798,7 +871,7 @@ class CuteFacePlayer:
             if duration > 0.0 and envelope:
                 idx = int((elapsed / duration) * (len(envelope) - 1))
                 idx = max(0, min(idx, len(envelope) - 1))
-                self._set_speaking_mouth(text, float(envelope[idx]))
+                self._set_speaking_mouth(text, float(envelope[idx]), progress)
             feedback_cb("playing", progress)
             if should_cancel():
                 process.terminate()
@@ -826,7 +899,7 @@ class CuteFacePlayer:
             return self._play_audio_only(wav_path, text, should_cancel, feedback_cb)
 
         envelope, duration = self._extract_envelope(wav_path)
-        self._set_speaking_mouth(text, 0.16)
+        self._set_speaking_mouth(text, 0.16, 0.0)
 
         pg = self._pygame
         try:
@@ -854,7 +927,7 @@ class CuteFacePlayer:
                 mouth_open = 0.16
                 progress = 0.0
 
-            self._set_speaking_mouth(text, mouth_open)
+            self._set_speaking_mouth(text, mouth_open, progress)
 
             if elapsed >= next_feedback_at:
                 feedback_cb("playing", progress)
