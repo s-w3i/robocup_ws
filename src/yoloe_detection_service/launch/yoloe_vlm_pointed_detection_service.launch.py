@@ -18,17 +18,20 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("camera_link_frame", default_value="camera0_link"),
         DeclareLaunchArgument("tf_ttl_sec", default_value="60.0"),
         DeclareLaunchArgument("tf_republish_hz", default_value="10.0"),
-        DeclareLaunchArgument("show_ui", default_value="true"),
+        DeclareLaunchArgument("show_ui", default_value="false"),
         DeclareLaunchArgument("save_dir", default_value="/home/usern/robocup_ws/yoloe_out"),
-        DeclareLaunchArgument("vlm_model", default_value="qwen3-vl:8b"),
+        DeclareLaunchArgument("vlm_model", default_value="qwen3.5:9b"),
         DeclareLaunchArgument("ollama_base_url", default_value="http://127.0.0.1:11434"),
         DeclareLaunchArgument("vote_frames", default_value="5"),
-        DeclareLaunchArgument("vlm_num_predict", default_value="128"),
-        DeclareLaunchArgument("vlm_retry_num_predict", default_value="384"),
+        DeclareLaunchArgument("vlm_num_predict", default_value="96"),
+        DeclareLaunchArgument("vlm_retry_num_predict", default_value="192"),
         DeclareLaunchArgument("vlm_max_retries", default_value="1"),
-        DeclareLaunchArgument("vlm_max_candidates", default_value="12"),
+        DeclareLaunchArgument("vlm_max_candidates", default_value="8"),
         DeclareLaunchArgument("vlm_use_thinking_fallback", default_value="true"),
         DeclareLaunchArgument("vlm_image_max_edge", default_value="960"),
+        DeclareLaunchArgument("vlm_min_bbox_area_ratio", default_value="0.008"),
+        DeclareLaunchArgument("vlm_small_object_max_bbox_area_ratio", default_value="0.03"),
+        DeclareLaunchArgument("pure_vlm_mode", default_value="true"),
     ]
 
     node = Node(
@@ -80,6 +83,9 @@ def generate_launch_description() -> LaunchDescription:
                 "vlm_max_candidates": LaunchConfiguration("vlm_max_candidates"),
                 "vlm_use_thinking_fallback": LaunchConfiguration("vlm_use_thinking_fallback"),
                 "vlm_image_max_edge": LaunchConfiguration("vlm_image_max_edge"),
+                "vlm_min_bbox_area_ratio": LaunchConfiguration("vlm_min_bbox_area_ratio"),
+                "vlm_small_object_max_bbox_area_ratio": LaunchConfiguration("vlm_small_object_max_bbox_area_ratio"),
+                "pure_vlm_mode": LaunchConfiguration("pure_vlm_mode"),
             }
         ],
     )

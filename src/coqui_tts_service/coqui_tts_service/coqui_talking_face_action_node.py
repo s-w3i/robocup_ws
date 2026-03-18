@@ -57,6 +57,8 @@ from std_msgs.msg import Bool, String
 from coqui_tts_interfaces.action import SpeakText
 from coqui_tts_interfaces.srv import RobotStatus, SynthesizeSpeech
 
+VALID_STATUSES = ("sleep", "listening", "idle", "thinking", "operating")
+
 
 class CuteFacePlayer:
     def __init__(
@@ -66,6 +68,7 @@ class CuteFacePlayer:
         height: int,
         fps: int,
         emotion_speed_scale: float = 1.0,
+        fullscreen: bool = True,
     ) -> None:
         self._logger = logger
         self.width = max(640, int(width))
@@ -73,6 +76,7 @@ class CuteFacePlayer:
         self.fps = max(60, fps)
         self._emotion_speed_scale = max(0.1, float(emotion_speed_scale))
         self._window_flags = 0
+        self._fullscreen = bool(fullscreen)
 
         self._pygame = None
         self._screen = None
@@ -167,25 +171,36 @@ class CuteFacePlayer:
             self._display_init_done.set()
             return
         try:
-            self._window_flags = int(getattr(self._pygame, "RESIZABLE", 0))
+            if self._fullscreen:
+                self._window_flags = int(getattr(self._pygame, "FULLSCREEN", 0)) | int(
+                    getattr(self._pygame, "NOFRAME", 0)
+                )
+            else:
+                self._window_flags = int(getattr(self._pygame, "RESIZABLE", 0))
 
             info = self._pygame.display.Info()
             display_w = int(getattr(info, "current_w", 0) or 0)
             display_h = int(getattr(info, "current_h", 0) or 0)
             if display_w > 0 and display_h > 0:
-                # Fit to display size with margins so it appears as a large, sharp window.
-                self.width = max(640, int(display_w * 0.96))
-                self.height = max(480, int(display_h * 0.90))
+                if self._fullscreen:
+                    self.width = max(640, display_w)
+                    self.height = max(480, display_h)
+                else:
+                    # Fit to display size with margins so it appears as a large, sharp window.
+                    self.width = max(640, int(display_w * 0.96))
+                    self.height = max(480, int(display_h * 0.90))
 
             self._screen = self._pygame.display.set_mode((self.width, self.height), self._window_flags)
-            self._pygame.display.set_caption("AVA")
+            if not self._fullscreen:
+                self._pygame.display.set_caption("AVA")
             self._text_font = self._pygame.font.SysFont(
                 "DejaVu Sans",
                 max(18, min(34, self.width // 22)),
                 bold=True,
             )
             self._display_ready = True
-            self._logger.info("Talking-face UI is active.")
+            mode_text = "fullscreen borderless" if self._fullscreen else "windowed"
+            self._logger.info(f"Talking-face UI is active ({mode_text}).")
         except Exception as exc:
             self._ui_failed = True
             self._display_ready = False
@@ -195,7 +210,7 @@ class CuteFacePlayer:
             self._display_init_done.set()
 
     def _resize_window(self, width: int, height: int) -> None:
-        if not self._display_ready:
+        if not self._display_ready or self._fullscreen:
             return
 
         new_w = max(640, int(width))
@@ -230,7 +245,7 @@ class CuteFacePlayer:
 
     def set_robot_status(self, status: str) -> bool:
         normalized = status.strip().lower()
-        if normalized not in ("sleep", "listening", "idle", "operating"):
+        if normalized not in VALID_STATUSES:
             return False
         with self._state_lock:
             if self._robot_status == normalized:
@@ -248,6 +263,10 @@ class CuteFacePlayer:
             return
         if self._robot_status == "listening":
             self._idle_emotion = "listening"
+            self._idle_emotion_until = float("inf")
+            return
+        if self._robot_status == "thinking":
+            self._idle_emotion = "thinking"
             self._idle_emotion_until = float("inf")
             return
         if now >= self._idle_emotion_until:
@@ -411,10 +430,25 @@ class CuteFacePlayer:
             return []
 
         clamped = max(0.0, min(1.0, float(progress)))
-        if clamped >= 0.999:
+        if len(pages) == 1 or clamped >= 0.999:
             idx = len(pages) - 1
         else:
-            idx = min(len(pages) - 1, int(clamped * len(pages)))
+            # Switch subtitle pages based on relative text weight instead of equal time slices.
+            # This keeps longer pages on screen longer and reduces early page flips.
+            page_weights = []
+            for page in pages:
+                joined = " ".join(page).strip()
+                weight = sum(1 for ch in joined if not ch.isspace())
+                page_weights.append(max(1, weight))
+
+            total_weight = sum(page_weights)
+            cumulative = 0.0
+            idx = len(pages) - 1
+            for page_idx, weight in enumerate(page_weights):
+                cumulative += weight / total_weight
+                if clamped < cumulative:
+                    idx = page_idx
+                    break
         return pages[idx]
 
     def _draw_face(
@@ -478,6 +512,11 @@ class CuteFacePlayer:
             eye_y -= int(self.height * 0.01)
             # Listening mode: subtle micro motion makes the status easier to recognize.
             eye_y += int(self.height * 0.004 * math.sin(now_t * 4.2))
+        elif mood == "thinking":
+            eye_h = max(108, int(eye_h * 0.96))
+            eye_w = max(50, int(eye_w * 0.86))
+            eye_y -= int(self.height * 0.018)
+            eye_offset = max(64, int(self.width * 0.135))
         elif mood == "surprised":
             eye_h = int(eye_h * 1.12)
             eye_w = int(eye_w * 0.95)
@@ -497,7 +536,17 @@ class CuteFacePlayer:
             eye_rect.center = (x_center, y_center + max(2, curve_h // 4))
             pg.draw.arc(screen, (20, 20, 24), eye_rect, 0.08 * math.pi, 0.92 * math.pi, 8)
 
-        def draw_open_eye(x_center: int, y_center: int, width_px: int, height_px: int) -> None:
+        def draw_open_eye(
+            x_center: int,
+            y_center: int,
+            width_px: int,
+            height_px: int,
+            *,
+            highlight_shift_x: float = -0.08,
+            highlight_shift_y: float = 0.23,
+            blue_offset_x: float = 0.0,
+            blue_offset_y: float = 0.16,
+        ) -> None:
             eye_rect = pg.Rect(0, 0, width_px, height_px)
             eye_rect.center = (x_center, y_center)
             pg.draw.ellipse(screen, (8, 8, 10), eye_rect)
@@ -508,8 +557,8 @@ class CuteFacePlayer:
             highlight_h = max(44, int(height_px * 0.44))
             highlight = pg.Rect(0, 0, highlight_w, highlight_h)
             highlight.center = (
-                eye_rect.centerx - int(width_px * 0.08),
-                eye_rect.top + int(height_px * 0.23),
+                eye_rect.centerx + int(width_px * highlight_shift_x),
+                eye_rect.top + int(height_px * highlight_shift_y),
             )
             pg.draw.ellipse(screen, (236, 236, 236), highlight)
             small_glint = pg.Rect(0, 0, max(8, highlight_w // 4), max(10, highlight_h // 4))
@@ -520,8 +569,8 @@ class CuteFacePlayer:
             blue_h = max(34, int(height_px * 0.34))
             blue_reflect = pg.Rect(0, 0, blue_w, blue_h)
             blue_reflect.center = (
-                eye_rect.centerx,
-                eye_rect.bottom - int(height_px * 0.16),
+                eye_rect.centerx + int(width_px * blue_offset_x),
+                eye_rect.bottom - int(height_px * blue_offset_y),
             )
             pg.draw.ellipse(screen, (6, 120, 201), blue_reflect)
             blue_reflect_inner = blue_reflect.inflate(-max(4, blue_w // 5), -max(4, blue_h // 5))
@@ -541,6 +590,27 @@ class CuteFacePlayer:
         elif blinking:
             draw_closed_eye(left_x, eye_y, eye_w)
             draw_closed_eye(right_x, eye_y, eye_w)
+        elif mood == "thinking":
+            draw_open_eye(
+                left_x,
+                eye_y,
+                eye_w,
+                eye_h,
+                highlight_shift_x=-0.02,
+                highlight_shift_y=0.06,
+                blue_offset_x=0.00,
+                blue_offset_y=0.08,
+            )
+            draw_open_eye(
+                right_x,
+                eye_y,
+                eye_w,
+                eye_h,
+                highlight_shift_x=-0.02,
+                highlight_shift_y=0.06,
+                blue_offset_x=0.00,
+                blue_offset_y=0.08,
+            )
         else:
             draw_open_eye(left_x, eye_y, eye_w, eye_h)
             draw_open_eye(right_x, eye_y, eye_w, eye_h)
@@ -610,6 +680,26 @@ class CuteFacePlayer:
                 pg.draw.rect(screen, bars_color, rect, border_radius=max(3, bar_w // 2))
                 glow_rect = rect.inflate(max(2, bar_w // 3), max(2, bar_w // 4))
                 pg.draw.rect(screen, bars_glow, glow_rect, width=1, border_radius=max(3, bar_w // 2))
+        elif mood == "thinking":
+            think_overlay = pg.Surface((self.width, self.height), pg.SRCALPHA)
+            pulse = 0.5 + 0.5 * math.sin(now_t * 1.8)
+            qmark_font = self._pygame.font.SysFont(
+                "DejaVu Sans",
+                max(56, min(132, self.width // 6)),
+                bold=True,
+            )
+            qmark_surface = qmark_font.render("?", True, (126, 150, 220))
+            qmark_rect = qmark_surface.get_rect()
+            qmark_rect.center = (
+                center_x,
+                center_y - int(self.height * 0.40) - int(self.height * 0.010 * pulse),
+            )
+            qmark_shadow = qmark_font.render("?", True, (106, 84, 104))
+            qmark_shadow_rect = qmark_shadow.get_rect()
+            qmark_shadow_rect.center = (qmark_rect.centerx + 2, qmark_rect.centery + 2)
+            think_overlay.blit(qmark_shadow, qmark_shadow_rect)
+            think_overlay.blit(qmark_surface, qmark_rect)
+            screen.blit(think_overlay, (0, 0))
 
         if mood == "sleepy":
             sleep_overlay = pg.Surface((self.width, self.height), pg.SRCALPHA)
@@ -653,10 +743,19 @@ class CuteFacePlayer:
 
         # Cheeks.
         cheek_color = (226, 73, 104)
+        if mood == "thinking":
+            cheek_color = (242, 126, 160)
         cheek_w = int(self.width * 0.13)
         cheek_h = int(self.height * 0.085)
+        if mood == "thinking":
+            cheek_w = int(self.width * 0.11)
+            cheek_h = int(self.height * 0.060)
         cheek_y = center_y + int(self.height * 0.14) + sleep_breathe_offset
+        if mood == "thinking":
+            cheek_y = center_y + int(self.height * 0.09)
         cheek_offset = int(self.width * 0.27)
+        if mood == "thinking":
+            cheek_offset = int(self.width * 0.20)
         left_cheek = pg.Rect(0, 0, cheek_w, cheek_h)
         right_cheek = pg.Rect(0, 0, cheek_w, cheek_h)
         left_cheek.center = (center_x - cheek_offset, cheek_y)
@@ -665,8 +764,11 @@ class CuteFacePlayer:
         pg.draw.ellipse(screen, cheek_color, right_cheek)
         left_cheek_shine = left_cheek.inflate(-max(8, cheek_w // 3), -max(8, cheek_h // 3))
         right_cheek_shine = right_cheek.inflate(-max(8, cheek_w // 3), -max(8, cheek_h // 3))
-        pg.draw.ellipse(screen, (241, 104, 132), left_cheek_shine)
-        pg.draw.ellipse(screen, (241, 104, 132), right_cheek_shine)
+        cheek_shine_color = (241, 104, 132)
+        if mood == "thinking":
+            cheek_shine_color = (255, 168, 190)
+        pg.draw.ellipse(screen, cheek_shine_color, left_cheek_shine)
+        pg.draw.ellipse(screen, cheek_shine_color, right_cheek_shine)
 
         mouth_center_y = center_y + int(self.height * 0.21) + sleep_breathe_offset
         if is_talking:
@@ -679,6 +781,7 @@ class CuteFacePlayer:
                 "surprised": 0.72,
                 "sleepy": 0.05,
                 "listening": 0.08,
+                "thinking": 0.02,
                 "wink_left": 0.16,
                 "wink_right": 0.16,
             }.get(idle_emotion, 0.10)
@@ -697,6 +800,39 @@ class CuteFacePlayer:
                 inner_shine = inner.inflate(-max(4, inner.width // 4), -max(4, inner.height // 4))
                 inner_shine.centery += max(2, inner.height // 10)
                 pg.draw.ellipse(screen, (220, 84, 95), inner_shine)
+        elif not is_talking and idle_emotion == "thinking":
+            hand_rect = pg.Rect(
+                0,
+                0,
+                int(self.width * 0.23),
+                int(self.height * 0.25),
+            )
+            hand_rect.center = (
+                center_x - int(self.width * 0.17),
+                mouth_center_y + int(self.height * 0.11),
+            )
+            pg.draw.arc(
+                screen,
+                (153, 102, 112),
+                hand_rect,
+                0.98 * math.pi,
+                1.92 * math.pi,
+                max(3, int(self.width * 0.0028)),
+            )
+
+            think_mouth_rect = pg.Rect(0, 0, int(self.width * 0.045), int(self.height * 0.032))
+            think_mouth_rect.center = (
+                center_x,
+                mouth_center_y - int(self.height * 0.010),
+            )
+            pg.draw.arc(
+                screen,
+                (105, 30, 35),
+                think_mouth_rect,
+                0.12 * math.pi,
+                0.88 * math.pi,
+                max(3, int(self.width * 0.0028)),
+            )
         elif mouth_norm < 0.18:
             smile_rect = pg.Rect(0, 0, int(self.width * 0.18), int(self.height * 0.10))
             smile_rect.center = (center_x, mouth_center_y)
@@ -960,6 +1096,7 @@ class CoquiTalkingFaceActionNode(Node):
         self.declare_parameter("face_height", 720)
         self.declare_parameter("face_fps", 30)
         self.declare_parameter("face_emotion_speed_scale", 0.8)
+        self.declare_parameter("face_fullscreen", True)
         self.declare_parameter("extra_site_packages", DEFAULT_COQUI_SITE_PACKAGES)
         self.declare_parameter("isolate_site_packages", True)
         self.declare_parameter("robot_status_topic", "/robot_status")
@@ -987,6 +1124,9 @@ class CoquiTalkingFaceActionNode(Node):
         self.face_fps = self.get_parameter("face_fps").get_parameter_value().integer_value
         self.face_emotion_speed_scale = (
             self.get_parameter("face_emotion_speed_scale").get_parameter_value().double_value
+        )
+        self.face_fullscreen = (
+            self.get_parameter("face_fullscreen").get_parameter_value().bool_value
         )
         self.extra_site_packages = self.get_parameter("extra_site_packages").get_parameter_value().string_value
         self.isolate_site_packages = (
@@ -1028,6 +1168,7 @@ class CoquiTalkingFaceActionNode(Node):
             height=self.face_height,
             fps=self.face_fps,
             emotion_speed_scale=self.face_emotion_speed_scale,
+            fullscreen=self.face_fullscreen,
         )
         self.face_player.start(wait_for_ui=True, timeout_sec=4.0)
         self.face_player.set_idle("")
@@ -1097,6 +1238,7 @@ class CoquiTalkingFaceActionNode(Node):
         self.get_logger().info(
             f"face_emotion_speed_scale: {self.face_emotion_speed_scale}"
         )
+        self.get_logger().info(f"face_fullscreen: {self.face_fullscreen}")
         self.get_logger().info(f"extra_site_packages: {self.extra_site_packages}")
         self.get_logger().info(
             f"isolate_site_packages: {self.isolate_site_packages} "
@@ -1123,7 +1265,7 @@ class CoquiTalkingFaceActionNode(Node):
 
     def _robot_status_callback(self, msg: String) -> None:
         status = str(msg.data).strip().lower()
-        if status not in ("sleep", "listening", "idle", "operating"):
+        if status not in VALID_STATUSES:
             self.get_logger().warn(
                 f"Ignoring invalid robot status '{status}' on {self.robot_status_topic}."
             )
@@ -1138,6 +1280,15 @@ class CoquiTalkingFaceActionNode(Node):
     def _awake_callback(self, msg: Bool) -> None:
         if not bool(msg.data):
             return
+
+        if self._robot_status == "sleep":
+            changed = self.face_player.set_robot_status("idle")
+            if changed:
+                self._robot_status = "idle"
+                self.get_logger().info(
+                    "Received /awake=true, exiting sleep state locally and requesting robot status 'idle'."
+                )
+            self._set_robot_status_async("idle")
 
         greeting = self.awake_greeting_text.strip()
         if not greeting:
@@ -1226,7 +1377,7 @@ class CoquiTalkingFaceActionNode(Node):
 
     def _set_robot_status_async(self, target: str) -> None:
         target = str(target).strip().lower()
-        if target not in ("sleep", "listening", "idle", "operating"):
+        if target not in VALID_STATUSES:
             return
 
         if not self._robot_status_client.wait_for_service(timeout_sec=0.5):

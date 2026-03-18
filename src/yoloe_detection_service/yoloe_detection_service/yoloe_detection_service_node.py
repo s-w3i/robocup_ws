@@ -34,16 +34,42 @@ from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformL
 from yoloe_detection_interfaces.srv import DetectObjectPrompt
 
 
+def _iter_site_packages_dirs() -> list[pathlib.Path]:
+    """Return unique site-packages directories visible to this process."""
+    candidates: list[pathlib.Path] = []
+    seen: set[str] = set()
+
+    raw_paths = [sysconfig.get_paths().get("purelib", ""), *sys.path]
+    for raw_path in raw_paths:
+        if not raw_path:
+            continue
+        path = pathlib.Path(raw_path).expanduser()
+        if not path.is_dir():
+            continue
+        try:
+            normalized = str(path.resolve())
+        except OSError:
+            normalized = str(path)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        candidates.append(path)
+    return candidates
+
+
 def ensure_torch_runtime_libs() -> None:
     """Expose CUDA libraries from pip wheels and system paths before importing torch."""
-    purelib = pathlib.Path(sysconfig.get_paths().get("purelib", ""))
     lib_dirs: list[str] = []
 
-    nvidia_root = purelib / "nvidia"
-    if nvidia_root.is_dir():
-        for lib_dir in nvidia_root.glob("*/lib"):
-            if lib_dir.is_dir():
-                lib_dirs.append(str(lib_dir))
+    for site_packages in _iter_site_packages_dirs():
+        nvidia_root = site_packages / "nvidia"
+        if nvidia_root.is_dir():
+            for lib_dir in nvidia_root.glob("*/lib"):
+                if lib_dir.is_dir():
+                    lib_dirs.append(str(lib_dir))
+        torch_lib = site_packages / "torch" / "lib"
+        if torch_lib.is_dir():
+            lib_dirs.append(str(torch_lib))
 
     for path in (
         "/usr/local/cuda/lib64",
@@ -66,17 +92,33 @@ def ensure_torch_runtime_libs() -> None:
 
 def preload_cupti_if_needed() -> None:
     """Preload CUPTI when available (helpful on Jetson CUDA setups)."""
-    candidates = [
-        pathlib.Path(
-            "/home/usern/coqui-venv/lib/python3.10/site-packages/nvidia/cuda_cupti/lib/libcupti.so.12"
-        ),
-        pathlib.Path("/usr/local/cuda-12.6/extras/CUPTI/lib64/libcupti.so.12"),
-        pathlib.Path("/usr/local/cuda/extras/CUPTI/lib64/libcupti.so.12"),
-    ]
+    candidates: list[pathlib.Path] = []
+    for site_packages in _iter_site_packages_dirs():
+        cupti_root = site_packages / "nvidia" / "cuda_cupti" / "lib"
+        if not cupti_root.is_dir():
+            continue
+        candidates.extend(
+            [
+                cupti_root / "libcupti.so.12",
+                cupti_root / "libcupti.so.11",
+                cupti_root / "libcupti.so",
+            ]
+        )
+        candidates.extend(sorted(cupti_root.glob("libcupti.so.*"), reverse=True))
+
+    candidates.extend(
+        [
+            pathlib.Path("/usr/local/cuda-12.6/extras/CUPTI/lib64/libcupti.so.12"),
+            pathlib.Path("/usr/local/cuda/extras/CUPTI/lib64/libcupti.so.12"),
+        ]
+    )
     for candidate in candidates:
         if candidate.exists():
-            ctypes.CDLL(str(candidate), mode=ctypes.RTLD_GLOBAL)
-            return
+            try:
+                ctypes.CDLL(str(candidate), mode=ctypes.RTLD_GLOBAL)
+                return
+            except OSError:
+                continue
 
 
 @dataclass

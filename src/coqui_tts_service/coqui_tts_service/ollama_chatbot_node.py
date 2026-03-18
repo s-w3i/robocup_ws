@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import select
 import subprocess
 import sys
 import threading
@@ -18,7 +19,7 @@ SYSTEM_SITE_PATH_PREFIXES = (
     "/usr/local/lib/python3.10/dist-packages",
 )
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
-VALID_STATUSES = ("sleep", "listening", "idle", "operating")
+VALID_STATUSES = ("sleep", "listening", "idle", "thinking", "operating")
 
 CHAT_RESPONSE_SCHEMA = {
     "type": "object",
@@ -89,9 +90,11 @@ class OllamaChatbotNode(Node):
         self.declare_parameter("speak_action_name", "/coqui_tts/speak")
         self.declare_parameter("get_command_fail_window_sec", 10.0)
         self.declare_parameter("get_command_retry_delay_sec", 0.2)
+        self.declare_parameter("debug_text_input_mode", False)
+        self.declare_parameter("debug_text_input_prompt", "You")
         self.declare_parameter("service_response_timeout_sec", 30.0)
         self.declare_parameter("ollama_base_url", os.environ.get("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL))
-        self.declare_parameter("ollama_model", os.environ.get("TEXT_MODEL", "qwen3:14b"))
+        self.declare_parameter("ollama_model", os.environ.get("TEXT_MODEL", "qwen3.5:9b"))
         self.declare_parameter("ollama_keep_alive", os.environ.get("OLLAMA_KEEP_ALIVE", "30m"))
         self.declare_parameter("ollama_timeout_sec", 180.0)
         self.declare_parameter("ollama_temperature", 0.2)
@@ -121,6 +124,8 @@ class OllamaChatbotNode(Node):
         self.speak_action_name = str(self.get_parameter("speak_action_name").value)
         self.get_command_fail_window_sec = float(self.get_parameter("get_command_fail_window_sec").value)
         self.get_command_retry_delay_sec = float(self.get_parameter("get_command_retry_delay_sec").value)
+        self.debug_text_input_mode = bool(self.get_parameter("debug_text_input_mode").value)
+        self.debug_text_input_prompt = str(self.get_parameter("debug_text_input_prompt").value).strip() or "You"
         self.service_response_timeout_sec = float(self.get_parameter("service_response_timeout_sec").value)
         self.ollama_base_url = str(self.get_parameter("ollama_base_url").value).rstrip("/")
         self.ollama_model = str(self.get_parameter("ollama_model").value)
@@ -148,6 +153,7 @@ class OllamaChatbotNode(Node):
         self._session_active = False
         self._pending_awake = False
         self._session_thread: threading.Thread | None = None
+        self._debug_tty_path = "/dev/tty"
 
         status_qos = QoSProfile(depth=1)
         status_qos.reliability = QoSReliabilityPolicy.RELIABLE
@@ -198,6 +204,9 @@ class OllamaChatbotNode(Node):
             "Ollama chatbot node ready. "
             f"model='{self.ollama_model}' get_command={self.get_command_service} "
             f"speak_action={self.speak_action_name} status_service={self.robot_status_service}"
+        )
+        self.get_logger().info(
+            f"debug_text_input_mode={self.debug_text_input_mode} prompt='{self.debug_text_input_prompt}'"
         )
         self.get_logger().info(
             f"Session start trigger: {self.awake_topic}=true + {self.awake_greeting_done_topic}=true"
@@ -281,6 +290,7 @@ class OllamaChatbotNode(Node):
                 history.append({"role": "user", "content": cleaned_user})
                 self._trim_history(history)
 
+                self._set_robot_status("thinking")
                 try:
                     assistant_reply, should_end, llm_reason = self._chat_with_ollama(history)
                 except Exception as exc:
@@ -288,6 +298,9 @@ class OllamaChatbotNode(Node):
                     assistant_reply = self.fallback_error_reply or "Sorry, I am having trouble right now."
                     should_end = True
                     llm_reason = f"Ollama error: {exc}"
+                finally:
+                    if not self._shutdown_event.is_set() and not self._session_cancel_event.is_set():
+                        self._set_robot_status("idle")
 
                 if assistant_reply:
                     history.append({"role": "assistant", "content": assistant_reply})
@@ -365,6 +378,30 @@ class OllamaChatbotNode(Node):
                 raise
             return json.loads(match.group(0))
 
+    @staticmethod
+    def _sanitize_spoken_reply(text: str) -> str:
+        cleaned = str(text).strip()
+        if not cleaned:
+            return ""
+
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
+        # Remove common schema/control fields if the model emits them as plain text.
+        cleaned = re.sub(
+            r'(?im)^\s*"?(assistant_reply|end_session|end_reason)"?\s*:\s*.*$',
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(
+            r"(?im)\b(end_session|end_reason)\s*=\s*[^,\n}]+",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(r"[{}\"]", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,:\n\t")
+        return cleaned
+
     def _chat_with_ollama(
         self, history: list[dict[str, str]]
     ) -> tuple[str, bool, str]:
@@ -394,7 +431,7 @@ class OllamaChatbotNode(Node):
 
         try:
             parsed = self._parse_json_relaxed(content)
-            reply = str(parsed.get("assistant_reply", "")).strip()
+            reply = self._sanitize_spoken_reply(parsed.get("assistant_reply", ""))
             should_end = _to_bool(parsed.get("end_session"))
             end_reason_raw = parsed.get("end_reason")
             end_reason = "" if end_reason_raw is None else str(end_reason_raw).strip()
@@ -402,10 +439,19 @@ class OllamaChatbotNode(Node):
                 reply = "Could you repeat that, please?"
             return reply, should_end, end_reason
         except Exception:
-            # Fall back to raw text if model ignores schema.
-            return content, False, ""
+            # Fall back to raw text if model ignores schema, but never speak control fields.
+            should_end = bool(
+                re.search(r"(?im)\bend_session\s*[:=]\s*(true|1|yes|on)\b", content)
+            )
+            reply = self._sanitize_spoken_reply(content)
+            if not reply and not should_end:
+                reply = "Could you repeat that, please?"
+            return reply, should_end, ""
 
     def _call_get_command(self) -> tuple[bool, str, str]:
+        if self.debug_text_input_mode:
+            return self._call_debug_text_command()
+
         if not self._get_command_client.wait_for_service(timeout_sec=0.5):
             return False, "", f"Service '{self.get_command_service}' not ready."
 
@@ -426,6 +472,65 @@ class OllamaChatbotNode(Node):
         if response.success and not text:
             return False, "", "Empty speech transcription."
         return False, "", text or "get_command failed."
+
+    def _call_debug_text_command(self) -> tuple[bool, str, str]:
+        prompt = f"{self.debug_text_input_prompt}: "
+        self.get_logger().info("Debug text input mode active. Waiting for terminal input.")
+
+        read_stream = None
+        write_stream = None
+        close_read = False
+        close_write = False
+        try:
+            if os.path.exists(self._debug_tty_path):
+                read_stream = open(self._debug_tty_path, "r", encoding="utf-8", buffering=1)
+                write_stream = open(self._debug_tty_path, "w", encoding="utf-8", buffering=1)
+                close_read = True
+                close_write = True
+            elif sys.stdin is not None and not sys.stdin.closed:
+                read_stream = sys.stdin
+                write_stream = sys.stdout if sys.stdout is not None and not sys.stdout.closed else None
+            else:
+                return False, "", "No interactive terminal available for debug text input."
+
+            prompt_written = False
+            while not self._shutdown_event.is_set() and not self._session_cancel_event.is_set():
+                try:
+                    if write_stream is not None and not prompt_written:
+                        write_stream.write(prompt)
+                        write_stream.flush()
+                        prompt_written = True
+                except Exception:
+                    pass
+
+                ready, _, _ = select.select([read_stream], [], [], 0.2)
+                if not ready:
+                    continue
+
+                line = read_stream.readline()
+                if line == "":
+                    return False, "", "Debug text input closed."
+
+                text = line.strip()
+                if not text:
+                    prompt_written = False
+                    continue
+                return True, text, ""
+
+            return False, "", "Canceled."
+        except Exception as exc:
+            return False, "", f"Debug text input failed: {exc}"
+        finally:
+            if close_read and read_stream is not None:
+                try:
+                    read_stream.close()
+                except Exception:
+                    pass
+            if close_write and write_stream is not None:
+                try:
+                    write_stream.close()
+                except Exception:
+                    pass
 
     def _speak_text(self, text: str) -> tuple[bool, str]:
         cleaned = str(text).strip()

@@ -10,7 +10,7 @@ from std_msgs.msg import Bool, String
 from coqui_tts_interfaces.srv import RobotStatus
 
 
-VALID_STATUSES = ("sleep", "listening", "idle", "operating")
+VALID_STATUSES = ("sleep", "listening", "idle", "thinking", "operating")
 TOGGLE_COMMANDS = ("", "toggle", "next", "cycle")
 
 
@@ -48,7 +48,7 @@ class RobotStatusNode(Node):
             f"Robot status service ready on {self.status_service} | topic={self.status_topic} | awake={self.awake_topic}"
         )
         self.get_logger().info(
-            "Valid statuses: sleep, listening, idle, operating "
+            "Valid statuses: sleep, listening, idle, thinking, operating "
             "(send empty string or 'toggle'/'next'/'cycle' to advance)."
         )
         self.get_logger().info(f"Current robot status: {self._status}")

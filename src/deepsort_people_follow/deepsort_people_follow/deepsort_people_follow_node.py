@@ -1301,25 +1301,42 @@ class DeepSortPeopleFollowNode(Node):
             y1 = track.y
             x2 = track.x + track.width
             y2 = track.y + track.height
+            center_x = x1 + track.width // 2
+            center_y = y1 + track.height // 2
 
             is_follow = follow_track_id is not None and track.track_id == follow_track_id
             color = (0, 0, 255) if is_follow else ((0, 165, 255) if track.reassociated else (0, 200, 0))
             thickness = 3 if is_follow else 2
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness)
 
-            label = f"id={track.track_id} conf={track.detector_confidence:.2f}"
+            label = f"ID {track.track_id}"
             if self.ui_show_depth_text:
                 valid = valid_tracks.get(track.track_id)
                 if valid is not None:
-                    label += f" z={float(valid.pose.pose.position.z):.2f}m"
+                    label += f"  {float(valid.pose.pose.position.z):.2f}m"
+            (text_w, text_h), baseline = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2
+            )
+            text_x = max(0, min(center_x - text_w // 2, annotated.shape[1] - text_w))
+            text_y = max(text_h, min(center_y + text_h // 2, annotated.shape[0] - baseline))
             cv2.putText(
                 annotated,
                 label,
-                (x1, max(0, y1 - 8)),
+                (text_x, text_y),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
+                0.9,
+                (0, 0, 0),
+                4,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                annotated,
+                label,
+                (text_x, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
                 color,
-                1,
+                2,
                 cv2.LINE_AA,
             )
 

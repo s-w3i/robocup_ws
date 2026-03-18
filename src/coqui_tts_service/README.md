@@ -21,6 +21,7 @@ ROS2 Coqui TTS nodes:
   - Wake-word mode only when robot status is `sleep`
   - On wake word (`hi eva` by default): requests robot status `idle`
   - On `/get_command`: sets status to `listening`, returns transcript in `response.message`, then sets status back to `idle`
+  - While an LLM prompt is in flight, the chatbot sets robot status to `thinking`
 - Legacy service-only node: `coqui_tts_service_node` (optional)
 
 ## Build
@@ -112,6 +113,7 @@ Set status:
 ros2 service call /robot_status coqui_tts_interfaces/srv/RobotStatus "{status: 'sleep'}"
 ros2 service call /robot_status coqui_tts_interfaces/srv/RobotStatus "{status: 'listening'}"
 ros2 service call /robot_status coqui_tts_interfaces/srv/RobotStatus "{status: 'idle'}"
+ros2 service call /robot_status coqui_tts_interfaces/srv/RobotStatus "{status: 'thinking'}"
 ros2 service call /robot_status coqui_tts_interfaces/srv/RobotStatus "{status: 'operating'}"
 ```
 

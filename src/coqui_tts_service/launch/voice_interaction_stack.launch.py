@@ -5,8 +5,9 @@ from pathlib import Path
 
 from ament_index_python.packages import get_package_prefix
 from launch import LaunchDescription
-from launch.actions import RegisterEventHandler, SetEnvironmentVariable
+from launch.actions import DeclareLaunchArgument, RegisterEventHandler, SetEnvironmentVariable
 from launch.event_handlers import OnProcessIO
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -31,9 +32,17 @@ def _resolved_pythonpath() -> str:
 
 
 def generate_launch_description() -> LaunchDescription:
+    face_fullscreen = LaunchConfiguration("face_fullscreen")
+
     set_pythonpath = SetEnvironmentVariable(
         name="PYTHONPATH",
         value=_resolved_pythonpath(),
+    )
+
+    declare_face_fullscreen = DeclareLaunchArgument(
+        "face_fullscreen",
+        default_value="true",
+        description="Run the talking-face UI in fullscreen borderless mode.",
     )
 
     robot_status_node = Node(
@@ -55,6 +64,11 @@ def generate_launch_description() -> LaunchDescription:
         executable="coqui_talking_face_action_node",
         name="coqui_talking_face_action_node",
         output="screen",
+        parameters=[
+            {
+                "face_fullscreen": face_fullscreen,
+            }
+        ],
     )
 
     whisper_started = {"value": False}
@@ -78,6 +92,7 @@ def generate_launch_description() -> LaunchDescription:
 
     return LaunchDescription(
         [
+            declare_face_fullscreen,
             set_pythonpath,
             robot_status_node,
             coqui_talking_face_action_node,

@@ -1,10 +1,11 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 
 
 def generate_launch_description() -> LaunchDescription:
+    default_site_packages = "/home/usern/coqui-venv/lib/python3.10/site-packages"
     args = [
         DeclareLaunchArgument("model_path", default_value="/home/usern/yoloe-26l-seg.pt"),
         DeclareLaunchArgument("device", default_value="auto"),
@@ -15,6 +16,7 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("camera_link_frame", default_value="camera_link"),
         DeclareLaunchArgument("save_dir", default_value="/home/usern/robocup_ws/yoloe_out"),
         DeclareLaunchArgument("always_save_image", default_value="false"),
+        DeclareLaunchArgument("python_site_packages", default_value=default_site_packages),
     ]
 
     node = Node(
@@ -22,6 +24,32 @@ def generate_launch_description() -> LaunchDescription:
         executable="yoloe_detection_service_node",
         name="yoloe_detection_service_node",
         output="screen",
+        additional_env={
+            "PYTHONPATH": [
+                LaunchConfiguration("python_site_packages"),
+                ":",
+                EnvironmentVariable("PYTHONPATH", default_value=""),
+            ],
+            "LD_LIBRARY_PATH": [
+                LaunchConfiguration("python_site_packages"),
+                "/nvidia/cublas/lib:",
+                LaunchConfiguration("python_site_packages"),
+                "/nvidia/cudnn/lib:",
+                LaunchConfiguration("python_site_packages"),
+                "/nvidia/cuda_cupti/lib:",
+                LaunchConfiguration("python_site_packages"),
+                "/nvidia/cuda_nvrtc/lib:",
+                LaunchConfiguration("python_site_packages"),
+                "/nvidia/cuda_runtime/lib:",
+                "/usr/local/cuda/lib64:",
+                "/usr/local/cuda-12.6/lib64:",
+                "/usr/local/cuda/targets/aarch64-linux/lib:",
+                "/usr/local/cuda-12.6/targets/aarch64-linux/lib:",
+                "/lib/aarch64-linux-gnu:",
+                "/usr/lib/aarch64-linux-gnu:",
+                EnvironmentVariable("LD_LIBRARY_PATH", default_value=""),
+            ],
+        },
         parameters=[
             {
                 "model_path": LaunchConfiguration("model_path"),

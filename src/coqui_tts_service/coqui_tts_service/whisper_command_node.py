@@ -19,7 +19,7 @@ SYSTEM_SITE_PATH_PREFIXES = (
     "/usr/lib/python3/dist-packages",
     "/usr/local/lib/python3.10/dist-packages",
 )
-VALID_STATUSES = ("sleep", "listening", "idle", "operating")
+VALID_STATUSES = ("sleep", "listening", "idle", "thinking", "operating")
 
 
 def prepend_site_packages(path: str) -> bool:

@@ -42,7 +42,16 @@ colcon build --packages-select yoloe_detection_interfaces yoloe_detection_servic
 
 ```bash
 cd /home/usern/robocup_ws
-./run_yoloe_detection_service_in_venv.sh
+source /opt/ros/humble/setup.bash
+source /home/usern/robocup_ws/install/setup.bash
+ros2 launch yoloe_detection_service yoloe_detection_service.launch.py
+```
+
+Use another venv without mixing packages by overriding `python_site_packages`:
+
+```bash
+ros2 launch yoloe_detection_service yoloe_detection_service.launch.py \
+  python_site_packages:=/home/usern/yoloe-venv/lib/python3.10/site-packages
 ```
 
 ## Call
@@ -92,13 +101,13 @@ ros2 service call /yoloe/detect_pointed_prompt yoloe_detection_interfaces/srv/De
 
 Behavior:
 
-- Runs YOLOE to produce candidate boxes for the requested prompt classes.
-- Sends a candidate-labeled image to local Ollama VLM (`qwen3-vl` by default).
-- VLM alone selects candidate ID (`-1` means no clear pointed target); no hand/arm cone fallback.
+- Supports `pure_vlm_mode` (default `true`) to ground objects directly with VLM JSON bbox/point output.
+- When `pure_vlm_mode:=false`, runs YOLOE to produce candidate boxes and uses VLM to select candidate ID.
+- Sends a query image to local Ollama VLM (`qwen3.5:9b` by default).
 - Includes VLM response hardening: retries with higher `num_predict` and optional parsing from VLM `thinking` field when `content` is empty.
 - Returns centroid pose and TF in `camera0_link` by default.
 - Republishes detected object TF on `/tf` for a configurable TTL (`tf_ttl_sec`, default 60s), then stops.
-- Publishes VLM candidate visualization on `/yoloe/vlm_pointing_query_image`.
+- Publishes VLM query/selection visualization on `/yoloe/vlm_pointing_query_image`.
 
 Run:
 
@@ -108,17 +117,21 @@ source /home/usern/robocup_ws/install/setup.bash
 ros2 launch yoloe_detection_service yoloe_vlm_pointed_detection_service.launch.py show_ui:=false
 ```
 
-Accuracy-first tuning (pure VLM):
+Stability-first tuning (pure VLM):
 
 ```bash
 ros2 launch yoloe_detection_service yoloe_vlm_pointed_detection_service.launch.py \
   show_ui:=false \
+  pure_vlm_mode:=true \
+  vlm_model:=qwen3.5:9b \
   vote_frames:=3 \
-  vlm_num_predict:=256 \
-  vlm_retry_num_predict:=512 \
+  vlm_num_predict:=96 \
+  vlm_retry_num_predict:=192 \
   vlm_max_retries:=1 \
-  vlm_max_candidates:=10 \
-  vlm_image_max_edge:=1280
+  vlm_max_candidates:=8 \
+  vlm_min_bbox_area_ratio:=0.008 \
+  vlm_small_object_max_bbox_area_ratio:=0.03 \
+  vlm_image_max_edge:=960
 ```
 
 Call:
