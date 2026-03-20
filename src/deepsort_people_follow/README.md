@@ -59,13 +59,27 @@ cd /home/usern/robocup_ws
 ./run_deepsort_people_follow_in_venv.sh
 ```
 
+Default runtime now uses:
+
+- `color_topic:=/camera0/color/image_raw`
+- `depth_topic:=/camera0/aligned_depth_to_color/image_raw`
+- `camera_info_topic:=/camera0/color/camera_info`
+- `reid_embedder:=clip`
+- `clip_model_name:=ViT-B/16`
+- `max_cosine_distance:=0.40`
+- `enable_ui:=true`
+
 Example override with ROS parameters:
 
 ```bash
 ./run_deepsort_people_follow_in_venv.sh --ros-args \
   -p model_path:=/home/usern/robocup_ws/yolo11s.pt \
-  -p color_topic:=/camera/color/image_raw \
-  -p depth_topic:=/camera/aligned_depth_to_color/image_raw \
+  -p color_topic:=/camera0/color/image_raw \
+  -p depth_topic:=/camera0/aligned_depth_to_color/image_raw \
+  -p camera_info_topic:=/camera0/color/camera_info \
+  -p reid_embedder:=clip \
+  -p clip_model_name:=ViT-B/16 \
+  -p max_cosine_distance:=0.40 \
   -p enable_ui:=true
 ```
 
@@ -87,7 +101,7 @@ ros2 service call /yoloe/set_tracking yoloe_detection_interfaces/srv/SetTracking
 
 - Tracker runs in human-only mode (`person`) for follow behavior.
 - ReID backend is selectable with `reid_embedder:=auto|torchreid|clip|mobilenet|hsv` (`auto` keeps legacy behavior).
-- Default ReID embedder is `torchreid` with `osnet_ain_x0_5`.
+- Default ReID embedder is `clip` with `ViT-B/16`.
 - For non-default `torchreid_model_name`, provide `embedder_weights_path` to use true ReID weights (otherwise torchreid loads ImageNet-pretrained weights).
 - If selected embedder init fails, node can auto-fallback to lightweight HSV embedding (`fallback_to_hsv_embedder:=true`).
 - `SetTracking` service no longer includes prompt fields; response returns a single `tracking_class`.

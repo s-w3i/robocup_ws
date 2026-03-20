@@ -194,7 +194,7 @@ def infer_task(name: str | None, drink: str | None) -> str:
 
 
 def initial_prompt() -> str:
-    return "Hello. Please tell me your name and your favourite drink."
+    return "Please tell me your name and your favourite drink."
 
 
 def confirmation_sentence(name: str | None, drink: str | None) -> str:

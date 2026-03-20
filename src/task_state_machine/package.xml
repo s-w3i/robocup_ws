@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>task_state_machine</name>
+  <version>0.0.1</version>
+  <description>YASMIN-based ROS 2 receptionist task state machine.</description>
+  <maintainer email="usern@example.com">usern</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>coqui_tts_interfaces</depend>
+  <depend>coqui_tts_service</depend>
+  <depend>vlm_interfaces</depend>
+  <depend>vlm_service</depend>
+  <depend>yoloe_detection_interfaces</depend>
+  <depend>yoloe_detection_service</depend>
+  <depend>geometry_msgs</depend>
+  <exec_depend>bt_tree_view</exec_depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>yasmin</exec_depend>
+  <exec_depend>yasmin_ros</exec_depend>
+  <exec_depend>yasmin_viewer</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

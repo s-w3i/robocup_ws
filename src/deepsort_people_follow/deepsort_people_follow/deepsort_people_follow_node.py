@@ -243,10 +243,10 @@ class DeepSortPeopleFollowNode(Node):
         self.declare_parameter("tracking_compat_topic", "/yoloe/tracking_detections")
         self.declare_parameter("follow_pose_topic", "/people/follow_target_pose")
 
-        self.declare_parameter("color_topic", "/camera/color/image_raw")
-        self.declare_parameter("depth_topic", "/camera/aligned_depth_to_color/image_raw")
-        self.declare_parameter("camera_info_topic", "/camera/color/camera_info")
-        self.declare_parameter("camera_link_frame", "camera_link")
+        self.declare_parameter("color_topic", "/camera0/color/image_raw")
+        self.declare_parameter("depth_topic", "/camera0/aligned_depth_to_color/image_raw")
+        self.declare_parameter("camera_info_topic", "/camera0/color/camera_info")
+        self.declare_parameter("camera_link_frame", "camera0_link")
         self.declare_parameter("tf_prefix", "person_id")
 
         self.declare_parameter("model_path", "/home/usern/robocup_ws/yolo11s.pt")
@@ -264,10 +264,10 @@ class DeepSortPeopleFollowNode(Node):
 
         self.declare_parameter("max_age", 1500)
         self.declare_parameter("n_init", 5)
-        self.declare_parameter("max_cosine_distance", 0.25)
+        self.declare_parameter("max_cosine_distance", 0.40)
         self.declare_parameter("nn_budget", 100)
         self.declare_parameter("nms_max_overlap", 1.0)
-        self.declare_parameter("reid_embedder", "auto")
+        self.declare_parameter("reid_embedder", "clip")
         self.declare_parameter("use_torchreid_embedder", True)
         self.declare_parameter("torchreid_model_name", "osnet_ain_x0_5")
         self.declare_parameter("torchreid_embedder_gpu", True)
@@ -280,7 +280,7 @@ class DeepSortPeopleFollowNode(Node):
 
         self.declare_parameter("debug_image_dir", "/home/usern/robocup_ws/yoloe_out")
         self.declare_parameter("debug_save_interval_s", 0.2)
-        self.declare_parameter("enable_ui", False)
+        self.declare_parameter("enable_ui", True)
         self.declare_parameter("ui_window_name", "DeepSORT Tracking")
         self.declare_parameter("ui_show_depth_text", True)
 
