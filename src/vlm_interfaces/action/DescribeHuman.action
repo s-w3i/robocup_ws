@@ -1,0 +1,19 @@
+---
+bool success
+bool human_present
+string reason
+string gender
+string cloth_color
+string pant_color
+bool wearing_glasses
+bool wearing_glasses_known
+string hair_color
+string speech_text
+string data_text
+string message
+string camera_used
+string model_name
+float32 elapsed_seconds
+---
+string stage
+string status

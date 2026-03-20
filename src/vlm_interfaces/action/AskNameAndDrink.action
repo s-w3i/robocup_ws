@@ -1,0 +1,23 @@
+bool think
+bool reset_session
+int32 max_attempts
+---
+bool success
+bool completed
+string task
+string reason
+string name
+string drink
+string robot_text
+string last_user_input
+bool spoke_response
+string message
+float32 elapsed_seconds
+int32 attempt_count
+---
+string stage
+string robot_text
+string name
+string drink
+string user_input
+int32 attempt_count

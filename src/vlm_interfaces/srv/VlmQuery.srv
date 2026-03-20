@@ -1,0 +1,19 @@
+bool need_image
+string camera_name
+string prompt
+string reasoning_mode
+string user_input
+string request_profile
+int32 max_retry_count
+int32 json_repair_mode
+int32 num_predict_override
+float32 timeout_sec_override
+---
+bool success
+string message
+string speech_text
+string data_text
+bool image_used
+string camera_used
+string reasoning_mode_used
+string model_name
