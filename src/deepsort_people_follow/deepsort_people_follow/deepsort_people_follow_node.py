@@ -16,6 +16,33 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+
+def _bootstrap_known_site_packages() -> None:
+    """Prefer project venv packages before importing heavy third-party modules."""
+    py_tag = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    candidates: list[pathlib.Path] = []
+
+    current_venv = os.environ.get("VIRTUAL_ENV", "").strip()
+    if current_venv:
+        candidates.append(pathlib.Path(current_venv) / "lib" / py_tag / "site-packages")
+
+    candidates.extend(
+        [
+            pathlib.Path("/home/usern/follow-venv/lib/python3.10/site-packages"),
+            pathlib.Path("/home/usern/coqui-venv/lib/python3.10/site-packages"),
+        ]
+    )
+
+    for candidate in reversed(candidates):
+        if candidate.is_dir():
+            candidate_str = str(candidate)
+            while candidate_str in sys.path:
+                sys.path.remove(candidate_str)
+            sys.path.insert(0, candidate_str)
+
+
+_bootstrap_known_site_packages()
+
 import cv2
 import numpy as np
 import rclpy
@@ -249,8 +276,8 @@ class DeepSortPeopleFollowNode(Node):
         self.declare_parameter("camera_link_frame", "camera0_link")
         self.declare_parameter("tf_prefix", "person_id")
 
-        self.declare_parameter("model_path", "/home/usern/robocup_ws/yolo11s.pt")
-        self.declare_parameter("device", "auto")
+        self.declare_parameter("model_path", "/home/usern/robocup_ws/yolo11m.pt")
+        self.declare_parameter("device", "cuda:0")
         self.declare_parameter("imgsz", 640)
         self.declare_parameter("det_conf", 0.45)
         self.declare_parameter("det_iou", 0.50)
@@ -264,15 +291,17 @@ class DeepSortPeopleFollowNode(Node):
 
         self.declare_parameter("max_age", 1500)
         self.declare_parameter("n_init", 5)
-        self.declare_parameter("max_cosine_distance", 0.40)
+        self.declare_parameter("max_cosine_distance", 0.25)
         self.declare_parameter("nn_budget", 100)
         self.declare_parameter("nms_max_overlap", 1.0)
-        self.declare_parameter("reid_embedder", "clip")
+        self.declare_parameter("reid_embedder", "torchreid")
         self.declare_parameter("use_torchreid_embedder", True)
-        self.declare_parameter("torchreid_model_name", "osnet_ain_x0_5")
+        self.declare_parameter("torchreid_model_name", "osnet_ain_x1_0")
         self.declare_parameter("torchreid_embedder_gpu", True)
         self.declare_parameter("clip_model_name", "ViT-B/16")
-        self.declare_parameter("embedder_weights_path", "")
+        self.declare_parameter(
+            "embedder_weights_path", "/home/usern/.cache/torch/checkpoints/osnet_ain_x1_0_imagenet.pth"
+        )
         self.declare_parameter("fallback_to_hsv_embedder", True)
 
         self.declare_parameter("publish_rate_hz", 0.0)
