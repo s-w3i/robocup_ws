@@ -62,7 +62,7 @@ cd /home/usern/robocup_ws
 Default runtime now uses:
 
 - `color_topic:=/camera0/color/image_raw`
-- `depth_topic:=/camera0/aligned_depth_to_color/image_raw`
+- `depth_topic:=/camera0/realsense_splitter_node/output/depth`
 - `camera_info_topic:=/camera0/color/camera_info`
 - `model_path:=/home/usern/robocup_ws/yolo11m.pt`
 - `device:=cuda:0`
@@ -79,7 +79,7 @@ Example override with ROS parameters:
   -p model_path:=/home/usern/robocup_ws/yolo11m.pt \
   -p device:=cuda:0 \
   -p color_topic:=/camera0/color/image_raw \
-  -p depth_topic:=/camera0/aligned_depth_to_color/image_raw \
+  -p depth_topic:=/camera0/realsense_splitter_node/output/depth \
   -p camera_info_topic:=/camera0/color/camera_info \
   -p reid_embedder:=torchreid \
   -p torchreid_model_name:=osnet_ain_x1_0 \

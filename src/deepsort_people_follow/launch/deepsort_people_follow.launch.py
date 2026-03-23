@@ -12,7 +12,7 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("tracking_compat_topic", default_value="/yoloe/tracking_detections"),
         DeclareLaunchArgument("follow_pose_topic", default_value="/people/follow_target_pose"),
         DeclareLaunchArgument("color_topic", default_value="/camera0/color/image_raw"),
-        DeclareLaunchArgument("depth_topic", default_value="/camera0/aligned_depth_to_color/image_raw"),
+        DeclareLaunchArgument("depth_topic", default_value="/camera0/realsense_splitter_node/output/depth"),
         DeclareLaunchArgument("camera_info_topic", default_value="/camera0/color/camera_info"),
         DeclareLaunchArgument("camera_link_frame", default_value="camera0_link"),
         DeclareLaunchArgument("tf_prefix", default_value="person_id"),

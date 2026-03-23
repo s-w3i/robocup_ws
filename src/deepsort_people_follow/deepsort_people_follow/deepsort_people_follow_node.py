@@ -225,9 +225,8 @@ def stamp_to_seconds(stamp: Any) -> float:
 
 def point_distance(a: PoseStamped, b: PoseStamped) -> float:
     dx = a.pose.position.x - b.pose.position.x
-    dy = a.pose.position.y - b.pose.position.y
     dz = a.pose.position.z - b.pose.position.z
-    return math.sqrt(dx * dx + dy * dy + dz * dz)
+    return math.sqrt(dx * dx + dz * dz)
 
 
 @dataclass
@@ -271,7 +270,7 @@ class DeepSortPeopleFollowNode(Node):
         self.declare_parameter("follow_pose_topic", "/people/follow_target_pose")
 
         self.declare_parameter("color_topic", "/camera0/color/image_raw")
-        self.declare_parameter("depth_topic", "/camera0/aligned_depth_to_color/image_raw")
+        self.declare_parameter("depth_topic", "/camera0/realsense_splitter_node/output/depth")
         self.declare_parameter("camera_info_topic", "/camera0/color/camera_info")
         self.declare_parameter("camera_link_frame", "camera0_link")
         self.declare_parameter("tf_prefix", "person_id")
@@ -1007,13 +1006,17 @@ class DeepSortPeopleFollowNode(Node):
             if depth_age_ms > self.max_depth_age_ms:
                 depth_valid = False
 
+        pose_frame_id = self.camera_link_frame
+        if camera_info is not None and camera_info.header.frame_id:
+            pose_frame_id = camera_info.header.frame_id
+
         tracks_3d_msg = PeopleTrack3DArray()
         tracks_3d_msg.header.stamp = stamp_msg
-        tracks_3d_msg.header.frame_id = self.camera_link_frame
+        tracks_3d_msg.header.frame_id = pose_frame_id
 
         compat_msg = Detection3DArray()
         compat_msg.header.stamp = stamp_msg
-        compat_msg.header.frame_id = self.camera_link_frame
+        compat_msg.header.frame_id = pose_frame_id
         compat_msg.prompt_text = self.tracking_class
         compat_msg.detections_in_frame = len(tracks2d)
         compat_msg.inference_ms = inference_ms
@@ -1036,11 +1039,11 @@ class DeepSortPeopleFollowNode(Node):
             out.detector_confidence = rec.detector_confidence
             out.tracker_confidence = rec.tracker_confidence
             out.pose_camera_link.header.stamp = stamp_msg
-            out.pose_camera_link.header.frame_id = self.camera_link_frame
+            out.pose_camera_link.header.frame_id = pose_frame_id
             out.pose_camera_link.pose.orientation.w = 1.0
             out.depth_m = 0.0
             out.valid_depth = False
-            out.tf_child_frame = f"{self.tf_prefix}_{rec.track_id}"
+            out.tf_child_frame = f"{self.tf_prefix}_{rec.track_id}" if rec.track_id == 1 else ""
 
             if depth_valid and depth_image is not None:
                 u = rec.x + rec.width // 2
@@ -1048,16 +1051,16 @@ class DeepSortPeopleFollowNode(Node):
                 depth_m = self._sample_depth_meters(depth_image, depth_encoding, u, v)
                 if depth_m is not None:
                     x_m = ((float(u) - cx) / fx) * depth_m
-                    y_m = ((float(v) - cy) / fy) * depth_m
                     z_m = depth_m
 
                     out.pose_camera_link.pose.position.x = float(x_m)
-                    out.pose_camera_link.pose.position.y = float(y_m)
+                    out.pose_camera_link.pose.position.y = 0.0
                     out.pose_camera_link.pose.position.z = float(z_m)
                     out.depth_m = float(z_m)
                     out.valid_depth = True
 
-                    self._publish_track_tf(out.tf_child_frame, out.pose_camera_link)
+                    if out.tf_child_frame:
+                        self._publish_track_tf(out.tf_child_frame, out.pose_camera_link)
 
                     det = Detection3D()
                     det.class_name = out.class_name
@@ -1170,7 +1173,7 @@ class DeepSortPeopleFollowNode(Node):
         point = np.array(
             [
                 float(pose.pose.position.x),
-                float(pose.pose.position.y),
+                0.0,
                 float(pose.pose.position.z),
             ],
             dtype=np.float64,
@@ -1218,7 +1221,7 @@ class DeepSortPeopleFollowNode(Node):
             if now_s - self._last_follow_seen_s <= self.lost_hold_sec:
                 held_pose = PoseStamped()
                 held_pose.header.stamp = stamp_msg
-                held_pose.header.frame_id = self.camera_link_frame
+                held_pose.header.frame_id = self._last_follow_pose.header.frame_id or self.camera_link_frame
                 held_pose.pose = self._last_follow_pose.pose
                 self._publish_follow_pose(held_pose, stamp_msg)
                 published = True
@@ -1252,7 +1255,7 @@ class DeepSortPeopleFollowNode(Node):
     def _publish_track_tf(self, child_frame: str, pose: PoseStamped) -> None:
         tf_msg = TransformStamped()
         tf_msg.header.stamp = pose.header.stamp
-        tf_msg.header.frame_id = self.camera_link_frame
+        tf_msg.header.frame_id = pose.header.frame_id or self.camera_link_frame
         tf_msg.child_frame_id = child_frame
         tf_msg.transform.translation.x = float(pose.pose.position.x)
         tf_msg.transform.translation.y = float(pose.pose.position.y)
@@ -1263,13 +1266,13 @@ class DeepSortPeopleFollowNode(Node):
     def _publish_follow_pose(self, pose: PoseStamped, stamp_msg: Any) -> None:
         follow_pose = PoseStamped()
         follow_pose.header.stamp = stamp_msg
-        follow_pose.header.frame_id = self.camera_link_frame
+        follow_pose.header.frame_id = pose.header.frame_id or self.camera_link_frame
         follow_pose.pose = pose.pose
         self._follow_pose_pub.publish(follow_pose)
 
         tf_msg = TransformStamped()
         tf_msg.header.stamp = stamp_msg
-        tf_msg.header.frame_id = self.camera_link_frame
+        tf_msg.header.frame_id = follow_pose.header.frame_id
         tf_msg.child_frame_id = "follow_target"
         tf_msg.transform.translation.x = float(follow_pose.pose.position.x)
         tf_msg.transform.translation.y = float(follow_pose.pose.position.y)
