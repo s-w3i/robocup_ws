@@ -80,6 +80,7 @@ def generate_launch_description() -> LaunchDescription:
         launch_arguments={
             "service_name": "/yoloe/detect_prompt",
             "model_path": yolo_model_path,
+            "default_camera_name": default_camera_name,
             "color_topic": color_topic,
             "depth_topic": depth_topic,
             "camera_info_topic": camera_info_topic,
@@ -128,6 +129,9 @@ def generate_launch_description() -> LaunchDescription:
         name="receptionist_state_machine_node",
         output="screen",
         condition=IfCondition(launch_state_machine),
+        additional_env={
+            "YOLO_DETECTION_CAMERA_NAME": default_camera_name,
+        },
     )
 
     bt_monitor_launch = IncludeLaunchDescription(
@@ -160,8 +164,8 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="/home/usern/coqui-venv/lib/python3.10/site-packages",
             ),
             DeclareLaunchArgument("face_fullscreen", default_value="false"),
-            DeclareLaunchArgument("launch_whisper", default_value="false"),
-            DeclareLaunchArgument("debug_text_input_mode", default_value="true"),
+            DeclareLaunchArgument("launch_whisper", default_value="true"),
+            DeclareLaunchArgument("debug_text_input_mode", default_value="false"),
             DeclareLaunchArgument("debug_text_input_prompt", default_value="guest"),
             DeclareLaunchArgument("launch_state_machine", default_value="false"),
             DeclareLaunchArgument("launch_bt_monitor", default_value="false"),

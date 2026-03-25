@@ -18,10 +18,13 @@ class YoloeDetectionClient(Node):
         while not self._client.wait_for_service(timeout_sec=1.0):
             self.get_logger().info(f"Waiting for service {service_name} ...")
 
-    def call(self, prompt_text: str, save_image: bool) -> DetectObjectPrompt.Response:
+    def call(
+        self, prompt_text: str, save_image: bool, camera_name: str
+    ) -> DetectObjectPrompt.Response:
         request = DetectObjectPrompt.Request()
         request.prompt_text = prompt_text
         request.save_image = save_image
+        request.camera_name = camera_name
 
         future = self._client.call_async(request)
         rclpy.spin_until_future_complete(self, future)
@@ -37,6 +40,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable image saving for this request (unless server always_save_image=true)",
     )
+    parser.add_argument(
+        "--camera-name",
+        default="",
+        help="Requested camera name (for example 'camera0' or 'camera'). Empty uses the server default.",
+    )
     return parser.parse_args()
 
 
@@ -46,7 +54,11 @@ def main(args: list[str] | None = None) -> None:
     rclpy.init(args=args)
     node = YoloeDetectionClient(cli_args.service)
     try:
-        response = node.call(cli_args.prompt, save_image=not cli_args.no_save_image)
+        response = node.call(
+            cli_args.prompt,
+            save_image=not cli_args.no_save_image,
+            camera_name=cli_args.camera_name,
+        )
         print("success:", response.success)
         print("message:", response.message)
         print("detections_in_frame:", response.detections_in_frame)

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from typing import Any
 
@@ -28,10 +29,12 @@ from yoloe_detection_interfaces.srv import DetectObjectPrompt
 
 
 HOST = "David"
+DEFAULT_YOLO_DETECTION_CAMERA_NAME = "camera0"
 
 FINAL_OUTCOME = "task_finished"
 RETRY = "retry"
 DETECT_GUEST_OUTCOME = "guest_detected"
+EMPTY_CHAIR_DETECTED = "empty_chair_detected"
 NAME_DRINK_CAPTURED = "name_drink_captured"
 CHARACTERISTICS_CAPTURED = "characteristics_captured"
 DELAY_DONE = "delay_done"
@@ -157,6 +160,71 @@ def build_characteristics_list_text(raw_text: str, summary_text: str) -> str:
     return summary_text.strip()
 
 
+def split_characteristics_text(text: str, max_items: int | None = None) -> list[str]:
+    items = [item.strip() for item in text.split(",") if item.strip()]
+    return items if max_items is None else items[:max_items]
+
+
+def join_spoken_list(items: list[str]) -> str:
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+def build_guest_appearance_description(text: str, max_items: int = 5) -> str:
+    items = split_characteristics_text(text, max_items=max_items)
+    if not items:
+        return ""
+
+    gender = ""
+    details: list[str] = []
+
+    for item in items:
+        normalized = item.lower()
+        if normalized in {"male", "female"}:
+            gender = normalized
+            continue
+        if normalized == "wearing glasses":
+            details.append("glasses")
+            continue
+        details.append(item)
+
+    details_text = join_spoken_list(details)
+    if gender and details_text:
+        return f"a {gender} guest with {details_text}"
+    if gender:
+        return f"a {gender} guest"
+    if details_text:
+        return f"a guest with {details_text}"
+    return ""
+
+
+def build_guest1_to_guest2_intro_text(blackboard: Blackboard) -> str:
+    guest1 = ensure_guest_memory(blackboard, "guest1")
+    guest2 = ensure_guest_memory(blackboard, "guest2")
+
+    guest1_name = guest1["name"].strip() or "the first guest"
+    guest2_name = guest2["name"].strip() or "guest"
+    drink = guest1["drink"].strip()
+    appearance_source = guest1["characteristics_list_text"] or guest1["characteristics_summary"]
+    appearance_description = build_guest_appearance_description(appearance_source)
+
+    if drink and appearance_description:
+        return (
+            f"{guest2_name}, this is {guest1_name}, whose favourite drink is {drink}, "
+            f"and who is {appearance_description}."
+        )
+    if drink:
+        return f"{guest2_name}, this is {guest1_name}, whose favourite drink is {drink}."
+    if appearance_description:
+        return f"{guest2_name}, this is {guest1_name}, who is {appearance_description}."
+    return f"{guest2_name}, this is {guest1_name}."
+
+
 def wait_for_future(_node, future: Future, timeout_sec: float) -> Any:
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
@@ -164,6 +232,13 @@ def wait_for_future(_node, future: Future, timeout_sec: float) -> Any:
             return future.result()
         time.sleep(0.05)
     raise TimeoutError("Timed out waiting for ROS response.")
+
+
+def get_yolo_detection_camera_name() -> str:
+    camera_name = os.environ.get(
+        "YOLO_DETECTION_CAMERA_NAME", DEFAULT_YOLO_DETECTION_CAMERA_NAME
+    ).strip()
+    return camera_name or DEFAULT_YOLO_DETECTION_CAMERA_NAME
 
 
 def call_speak_text(node, action_name: str, text: str, timeout_sec: float = 30.0) -> None:
@@ -296,6 +371,15 @@ class VlmSpeechState(State):
         return TIMEOUT
 
 
+class PrepareGuest1ToGuest2IntroState(State):
+    def __init__(self) -> None:
+        super().__init__({INTRO_READY})
+
+    def execute(self, blackboard: Blackboard) -> str:
+        blackboard["guest1_to_guest2_intro_text"] = build_guest1_to_guest2_intro_text(blackboard)
+        return INTRO_READY
+
+
 class StoreAskNameAndDrinkState(ActionState):
     def __init__(self) -> None:
         super().__init__(
@@ -385,6 +469,7 @@ class DetectGuestState(ServiceState):
         request = DetectObjectPrompt.Request()
         request.prompt_text = "person"
         request.save_image = False
+        request.camera_name = get_yolo_detection_camera_name()
         return request
 
     def response_handler(self, blackboard: Blackboard, response: DetectObjectPrompt.Response) -> str:
@@ -423,6 +508,41 @@ class DetectGuestState(ServiceState):
         return ABORT
 
 
+class DetectEmptyChairState(State):
+    def __init__(self) -> None:
+        super().__init__({EMPTY_CHAIR_DETECTED, RETRY})
+        self._node = YasminNode.get_instance()
+        self._service_name = "/yoloe/detect_prompt"
+        self._client = self._node.create_client(DetectObjectPrompt, self._service_name)
+
+    def execute(self, blackboard: Blackboard) -> str:
+        request = DetectObjectPrompt.Request()
+        request.prompt_text = "an empty chair"
+        request.save_image = True
+        request.camera_name = get_yolo_detection_camera_name()
+
+        try:
+            if not self._client.wait_for_service(timeout_sec=5.0):
+                blackboard["last_empty_chair_detect_message"] = (
+                    f"Service '{self._service_name}' is not available."
+                )
+                return RETRY
+
+            response = wait_for_future(self._node, self._client.call_async(request), 20.0)
+            if response is None or not response.success:
+                blackboard["last_empty_chair_detect_message"] = (
+                    "" if response is None else response.message
+                ) or "Empty chair detection service reported failure."
+                return RETRY
+
+            blackboard["last_empty_chair_detect_message"] = response.message
+            blackboard["last_empty_chair_image_path"] = response.saved_image_path
+            return EMPTY_CHAIR_DETECTED
+        except Exception as exc:
+            blackboard["last_empty_chair_detect_message"] = str(exc)
+            return RETRY
+
+
 def host_intro_prompt(blackboard: Blackboard) -> str:
     guest = get_current_guest_memory(blackboard)
     return (
@@ -440,35 +560,6 @@ def host_intro_prompt(blackboard: Blackboard) -> str:
         f"Favourite drink: {guest['drink']}. "
         "Do not mention appearance or any extra facts."
     )
-
-
-def guest1_to_guest2_prompt(blackboard: Blackboard) -> str:
-    guest1 = ensure_guest_memory(blackboard, "guest1")
-    guest2 = ensure_guest_memory(blackboard, "guest2")
-    return (
-        "Generate exactly one short spoken sentence to introduce guest1 to guest2. "
-        "Return JSON through the normal VLM response format. "
-        "Set speech_text to the sentence the robot should say aloud. "
-        "Set data_text to a JSON object with keys task, reason, complete, and entities. "
-        "Set task to 'introduce_guest1_to_guest2'. "
-        "Set reason to a short explanation of which guest1 details were used. "
-        "Set complete to true. "
-        "Set entities to an object with keys guest1_name, guest2_name, favourite_drink, and characteristics_used. "
-        "Speak directly to guest2. "
-        "Introduce only guest1 to guest2. "
-        "You must include guest1 name, favourite drink, and the supplied appearance characteristics. "
-        "The spoken sentence must mention the favourite drink and all supplied characteristics when they are short enough to fit naturally in one sentence. "
-        "Do not omit gender, shirt color, pant color, hair color, or glasses if they are present in the supplied characteristics list. "
-        "Use the supplied characteristics list as the authoritative source for what must be mentioned. "
-        f"Guest2 name: {guest2['name']}. "
-        f"Guest1 name: {guest1['name']}. "
-        f"Guest1 favourite drink: {guest1['drink']}. "
-        f"Guest1 characteristics list: {guest1['characteristics_list_text']}. "
-        f"Guest1 characteristics summary: {guest1['characteristics_summary']}. "
-        f"Guest1 characteristics raw data: {guest1['characteristics']}. "
-        "Do not mention the host in this sentence."
-    )
-
 
 def build_state_machine() -> StateMachine:
     sm = StateMachine(outcomes=[FINAL_OUTCOME, ABORT])
@@ -532,7 +623,36 @@ def build_state_machine() -> StateMachine:
     sm.add_state(
         "INTRODUCE_GUEST1_TO_HOST",
         SpeakState(lambda bb: str(bb["current_host_intro_text"]), "spoken"),
+        transitions={"spoken": "ANNOUNCE_EMPTY_CHAIR_DETECTION_GUEST1", ABORT: ABORT},
+    )
+    sm.add_state(
+        "ANNOUNCE_EMPTY_CHAIR_DETECTION_GUEST1",
+        SpeakState(
+            lambda bb: f"Hi {get_current_guest_memory(bb)['name']}, I will find you an empty seat",
+            "spoken",
+        ),
+        transitions={"spoken": "DETECT_EMPTY_CHAIR_GUEST1", ABORT: ABORT},
+    )
+    sm.add_state(
+        "DETECT_EMPTY_CHAIR_GUEST1",
+        DetectEmptyChairState(),
+        transitions={
+            EMPTY_CHAIR_DETECTED: "ANNOUNCE_EMPTY_CHAIR_FOUND_GUEST1",
+            RETRY: "EMPTY_CHAIR_DETECTION_RETRY_WARNING_GUEST1",
+        },
+    )
+    sm.add_state(
+        "ANNOUNCE_EMPTY_CHAIR_FOUND_GUEST1",
+        SpeakState(
+            lambda bb: f"Hi {get_current_guest_memory(bb)['name']}, you may have your seat here",
+            "spoken",
+        ),
         transitions={"spoken": "NAVIGATE_BACK_TO_START", ABORT: ABORT},
+    )
+    sm.add_state(
+        "EMPTY_CHAIR_DETECTION_RETRY_WARNING_GUEST1",
+        SpeakState(lambda _: "Sorry, I cannot find any empty seat, let me try again", "spoken"),
+        transitions={"spoken": "DETECT_EMPTY_CHAIR_GUEST1", ABORT: ABORT},
     )
     sm.add_state(
         "NAVIGATE_BACK_TO_START",
@@ -609,13 +729,42 @@ def build_state_machine() -> StateMachine:
     )
     sm.add_state(
         "PREPARE_GUEST1_TO_GUEST2_INTRO",
-        VlmSpeechState(guest1_to_guest2_prompt, "guest1_to_guest2_intro_text"),
-        transitions={INTRO_READY: "INTRODUCE_GUEST1_TO_GUEST2", ABORT: ABORT, TIMEOUT: ABORT},
+        PrepareGuest1ToGuest2IntroState(),
+        transitions={INTRO_READY: "INTRODUCE_GUEST1_TO_GUEST2"},
     )
     sm.add_state(
         "INTRODUCE_GUEST1_TO_GUEST2",
         SpeakState(lambda bb: str(bb["guest1_to_guest2_intro_text"]), "spoken"),
+        transitions={"spoken": "ANNOUNCE_EMPTY_CHAIR_DETECTION_GUEST2", ABORT: ABORT},
+    )
+    sm.add_state(
+        "ANNOUNCE_EMPTY_CHAIR_DETECTION_GUEST2",
+        SpeakState(
+            lambda bb: f"Hi {get_current_guest_memory(bb)['name']}, I will find you an empty seat",
+            "spoken",
+        ),
+        transitions={"spoken": "DETECT_EMPTY_CHAIR_GUEST2", ABORT: ABORT},
+    )
+    sm.add_state(
+        "DETECT_EMPTY_CHAIR_GUEST2",
+        DetectEmptyChairState(),
+        transitions={
+            EMPTY_CHAIR_DETECTED: "ANNOUNCE_EMPTY_CHAIR_FOUND_GUEST2",
+            RETRY: "EMPTY_CHAIR_DETECTION_RETRY_WARNING_GUEST2",
+        },
+    )
+    sm.add_state(
+        "ANNOUNCE_EMPTY_CHAIR_FOUND_GUEST2",
+        SpeakState(
+            lambda bb: f"Hi {get_current_guest_memory(bb)['name']}, you may have your seat here",
+            "spoken",
+        ),
         transitions={"spoken": FINAL_OUTCOME, ABORT: ABORT},
+    )
+    sm.add_state(
+        "EMPTY_CHAIR_DETECTION_RETRY_WARNING_GUEST2",
+        SpeakState(lambda _: "Sorry, I cannot find any empty seat, let me try again", "spoken"),
+        transitions={"spoken": "DETECT_EMPTY_CHAIR_GUEST2", ABORT: ABORT},
     )
 
     return sm
@@ -634,6 +783,8 @@ def create_blackboard() -> Blackboard:
     blackboard["navigation_delay_sec"] = 8.0
     blackboard["return_navigation_delay_sec"] = 5.0
     blackboard["last_detect_message"] = ""
+    blackboard["last_empty_chair_detect_message"] = ""
+    blackboard["last_empty_chair_image_path"] = ""
     blackboard["last_error"] = ""
     blackboard["last_spoken_text"] = ""
     blackboard["duplicate_guest_name"] = ""

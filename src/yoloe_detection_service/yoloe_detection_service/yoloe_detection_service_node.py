@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""YOLOE text-prompt detection service node for Dabai camera streams.
+"""YOLOE text-prompt detection service node for multiple camera streams.
 
 This node loads YOLOE once and supports single-shot detection via
 service (/yoloe/detect_prompt).
@@ -140,6 +140,30 @@ class DetectionRunResult:
     error_message: str
 
 
+@dataclass(frozen=True)
+class CameraStreamConfig:
+    name: str
+    color_topic: str
+    depth_topic: str
+    camera_info_topic: str
+    camera_link_frame: str
+
+
+@dataclass
+class CameraStreamState:
+    latest_color_image: np.ndarray | None = None
+    latest_depth_image: np.ndarray | None = None
+    latest_depth_frame: str = ""
+    latest_depth_encoding: str = ""
+    latest_camera_info: CameraInfo | None = None
+
+
+@dataclass
+class PublishedTFEntry:
+    parent_frame: str
+    translation: np.ndarray
+
+
 class YoloeDetectionServiceNode(Node):
     def __init__(self) -> None:
         super().__init__("yoloe_detection_service_node")
@@ -153,10 +177,19 @@ class YoloeDetectionServiceNode(Node):
         self.declare_parameter("max_det", 300)
         self.declare_parameter("force_torch_nms", True)
 
-        self.declare_parameter("color_topic", "/camera/color/image_raw")
-        self.declare_parameter("depth_topic", "/camera/depth/image_raw")
-        self.declare_parameter("camera_info_topic", "/camera/color/camera_info")
-        self.declare_parameter("camera_link_frame", "camera_link")
+        self.declare_parameter("default_camera_name", "camera0")
+        self.declare_parameter("color_topic", "/camera0/color/image_raw")
+        self.declare_parameter("depth_topic", "/camera0/realsense_splitter_node/output/depth")
+        self.declare_parameter("camera_info_topic", "/camera0/color/camera_info")
+        self.declare_parameter("camera_link_frame", "camera0_link")
+        self.declare_parameter("camera0_color_topic", "")
+        self.declare_parameter("camera0_depth_topic", "")
+        self.declare_parameter("camera0_camera_info_topic", "")
+        self.declare_parameter("camera0_camera_link_frame", "")
+        self.declare_parameter("camera_color_topic", "/camera/color/image_raw")
+        self.declare_parameter("camera_depth_topic", "/camera/depth/image_raw")
+        self.declare_parameter("camera_camera_info_topic", "/camera/color/camera_info")
+        self.declare_parameter("camera_camera_link_frame", "camera_link")
 
         self.declare_parameter("pose_topic", "/yoloe/detected_pose")
         self.declare_parameter("object_frame_prefix", "")
@@ -176,10 +209,49 @@ class YoloeDetectionServiceNode(Node):
         self.max_det = int(self.get_parameter("max_det").value)
         self.force_torch_nms = bool(self.get_parameter("force_torch_nms").value)
 
-        self.color_topic = str(self.get_parameter("color_topic").value)
-        self.depth_topic = str(self.get_parameter("depth_topic").value)
-        self.camera_info_topic = str(self.get_parameter("camera_info_topic").value)
-        self.camera_link_frame = str(self.get_parameter("camera_link_frame").value)
+        self.default_camera_name = self._normalize_camera_name(
+            str(self.get_parameter("default_camera_name").value)
+        )
+
+        legacy_color_topic = str(self.get_parameter("color_topic").value)
+        legacy_depth_topic = str(self.get_parameter("depth_topic").value)
+        legacy_camera_info_topic = str(self.get_parameter("camera_info_topic").value)
+        legacy_camera_link_frame = str(self.get_parameter("camera_link_frame").value)
+
+        camera0_color_topic = self._coalesce_non_empty(
+            str(self.get_parameter("camera0_color_topic").value), legacy_color_topic
+        )
+        camera0_depth_topic = self._coalesce_non_empty(
+            str(self.get_parameter("camera0_depth_topic").value), legacy_depth_topic
+        )
+        camera0_camera_info_topic = self._coalesce_non_empty(
+            str(self.get_parameter("camera0_camera_info_topic").value), legacy_camera_info_topic
+        )
+        camera0_camera_link_frame = self._coalesce_non_empty(
+            str(self.get_parameter("camera0_camera_link_frame").value), legacy_camera_link_frame
+        )
+
+        self._camera_configs: dict[str, CameraStreamConfig] = {
+            "camera0": CameraStreamConfig(
+                name="camera0",
+                color_topic=camera0_color_topic,
+                depth_topic=camera0_depth_topic,
+                camera_info_topic=camera0_camera_info_topic,
+                camera_link_frame=camera0_camera_link_frame,
+            ),
+            "camera": CameraStreamConfig(
+                name="camera",
+                color_topic=str(self.get_parameter("camera_color_topic").value),
+                depth_topic=str(self.get_parameter("camera_depth_topic").value),
+                camera_info_topic=str(self.get_parameter("camera_camera_info_topic").value),
+                camera_link_frame=str(self.get_parameter("camera_camera_link_frame").value),
+            ),
+        }
+        if self.default_camera_name not in self._camera_configs:
+            self.get_logger().warn(
+                f"Unsupported default_camera_name '{self.default_camera_name}', falling back to camera0."
+            )
+            self.default_camera_name = "camera0"
 
         self.pose_topic = str(self.get_parameter("pose_topic").value)
         self.object_frame_prefix = str(self.get_parameter("object_frame_prefix").value)
@@ -196,13 +268,12 @@ class YoloeDetectionServiceNode(Node):
         self._lock = threading.Lock()
         self._inference_lock = threading.Lock()
 
-        self._latest_color_image: np.ndarray | None = None
-        self._latest_depth_image: np.ndarray | None = None
-        self._latest_depth_frame: str = ""
-        self._latest_depth_encoding: str = ""
-        self._latest_camera_info: CameraInfo | None = None
+        self._camera_states = {
+            camera_name: CameraStreamState() for camera_name in self._camera_configs
+        }
+        self._subscriptions: list[Any] = []
 
-        self._last_tf_map: dict[str, np.ndarray] = {}
+        self._last_tf_map: dict[str, PublishedTFEntry] = {}
 
         self._model: Any = None
         self._prompt_key: tuple[str, ...] | None = None
@@ -213,9 +284,8 @@ class YoloeDetectionServiceNode(Node):
         self._tf_broadcaster = TransformBroadcaster(self)
 
         self._pose_pub = self.create_publisher(PoseStamped, self.pose_topic, 10)
-        self.create_subscription(Image, self.color_topic, self._on_color_image, qos_profile_sensor_data)
-        self.create_subscription(Image, self.depth_topic, self._on_depth_image, qos_profile_sensor_data)
-        self.create_subscription(CameraInfo, self.camera_info_topic, self._on_camera_info, qos_profile_sensor_data)
+        for camera_name, config in self._camera_configs.items():
+            self._subscribe_camera_streams(camera_name, config)
 
         self.create_service(DetectObjectPrompt, self.service_name, self._handle_detect_request)
         self.create_timer(0.2, self._publish_last_tf)
@@ -225,12 +295,38 @@ class YoloeDetectionServiceNode(Node):
         self.get_logger().info(f"YOLOE service ready on {self.service_name}")
         self.get_logger().info(f"Using model: {self.model_path}")
         self.get_logger().info(f"Device: {self._device}")
-        self.get_logger().info(f"Color topic: {self.color_topic}")
-        self.get_logger().info(f"Depth topic: {self.depth_topic}")
-        self.get_logger().info(f"Camera info topic: {self.camera_info_topic}")
-        self.get_logger().info(f"camera_link frame: {self.camera_link_frame}")
+        self.get_logger().info(f"Default camera: {self.default_camera_name}")
+        for config in self._camera_configs.values():
+            self.get_logger().info(
+                f"[{config.name}] color={config.color_topic} depth={config.depth_topic} "
+                f"camera_info={config.camera_info_topic} frame={config.camera_link_frame}"
+            )
         self.get_logger().info(f"Save dir: {self.save_dir}")
         self.get_logger().info(f"Always save image override: {self.always_save_image}")
+
+    def _subscribe_camera_streams(self, camera_name: str, config: CameraStreamConfig) -> None:
+        self._subscriptions.extend(
+            [
+                self.create_subscription(
+                    Image,
+                    config.color_topic,
+                    lambda msg, camera_name=camera_name: self._on_color_image(camera_name, msg),
+                    qos_profile_sensor_data,
+                ),
+                self.create_subscription(
+                    Image,
+                    config.depth_topic,
+                    lambda msg, camera_name=camera_name: self._on_depth_image(camera_name, msg),
+                    qos_profile_sensor_data,
+                ),
+                self.create_subscription(
+                    CameraInfo,
+                    config.camera_info_topic,
+                    lambda msg, camera_name=camera_name: self._on_camera_info(camera_name, msg),
+                    qos_profile_sensor_data,
+                ),
+            ]
+        )
 
     def _load_model(self) -> None:
         ensure_torch_runtime_libs()
@@ -253,31 +349,32 @@ class YoloeDetectionServiceNode(Node):
             return requested
         return "cuda" if torch_module.cuda.is_available() else "cpu"
 
-    def _on_color_image(self, msg: Image) -> None:
+    def _on_color_image(self, camera_name: str, msg: Image) -> None:
         try:
             image = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         except CvBridgeError as exc:
-            self.get_logger().warn(f"Failed to convert color image: {exc}")
+            self.get_logger().warn(f"[{camera_name}] Failed to convert color image: {exc}")
             return
 
         with self._lock:
-            self._latest_color_image = image
+            self._camera_states[camera_name].latest_color_image = image
 
-    def _on_depth_image(self, msg: Image) -> None:
+    def _on_depth_image(self, camera_name: str, msg: Image) -> None:
         try:
             depth = self._bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
         except CvBridgeError as exc:
-            self.get_logger().warn(f"Failed to convert depth image: {exc}")
+            self.get_logger().warn(f"[{camera_name}] Failed to convert depth image: {exc}")
             return
 
         with self._lock:
-            self._latest_depth_image = depth
-            self._latest_depth_frame = msg.header.frame_id
-            self._latest_depth_encoding = msg.encoding
+            state = self._camera_states[camera_name]
+            state.latest_depth_image = depth
+            state.latest_depth_frame = msg.header.frame_id
+            state.latest_depth_encoding = msg.encoding
 
-    def _on_camera_info(self, msg: CameraInfo) -> None:
+    def _on_camera_info(self, camera_name: str, msg: CameraInfo) -> None:
         with self._lock:
-            self._latest_camera_info = msg
+            self._camera_states[camera_name].latest_camera_info = msg
 
     def _handle_detect_request(
         self, request: DetectObjectPrompt.Request, response: DetectObjectPrompt.Response
@@ -299,7 +396,14 @@ class YoloeDetectionServiceNode(Node):
             response.message = str(exc)
             return response
 
-        run_result = self._run_detection(prompts, request.save_image)
+        try:
+            camera_name = self._resolve_camera_name(request.camera_name)
+        except ValueError as exc:
+            response.message = str(exc)
+            return response
+
+        config = self._camera_configs[camera_name]
+        run_result = self._run_detection(camera_name, prompts, request.save_image)
         response.detections_in_frame = run_result.detections_in_frame
         response.tf_published_count = run_result.tf_published_count
         response.inference_ms = run_result.inference_ms
@@ -318,7 +422,7 @@ class YoloeDetectionServiceNode(Node):
         response.success = True
         response.message = (
             f"Published {response.tf_published_count}/{response.detections_in_frame} TF frames in "
-            f"{self.camera_link_frame}."
+            f"{config.camera_link_frame} using camera '{camera_name}'."
         )
         if run_result.skipped_count > 0:
             response.message += (
@@ -326,16 +430,26 @@ class YoloeDetectionServiceNode(Node):
             )
         return response
 
-    def _run_detection(self, prompts: list[str], save_image_request: bool) -> DetectionRunResult:
+    def _run_detection(
+        self, camera_name: str, prompts: list[str], save_image_request: bool
+    ) -> DetectionRunResult:
+        config = self._camera_configs[camera_name]
         with self._lock:
-            color_image = None if self._latest_color_image is None else self._latest_color_image.copy()
-            depth_image = None if self._latest_depth_image is None else self._latest_depth_image.copy()
-            depth_encoding = self._latest_depth_encoding
-            depth_frame = self._latest_depth_frame
-            camera_info = self._latest_camera_info
+            state = self._camera_states[camera_name]
+            color_image = (
+                None if state.latest_color_image is None else state.latest_color_image.copy()
+            )
+            depth_image = (
+                None if state.latest_depth_image is None else state.latest_depth_image.copy()
+            )
+            depth_encoding = state.latest_depth_encoding
+            depth_frame = state.latest_depth_frame
+            camera_info = state.latest_camera_info
 
         if color_image is None:
-            return DetectionRunResult([], 0, 0, 0.0, "", 0, f"No image received on {self.color_topic}.")
+            return DetectionRunResult(
+                [], 0, 0, 0.0, "", 0, f"No image received on {config.color_topic}."
+            )
         if depth_image is None:
             return DetectionRunResult(
                 [],
@@ -344,7 +458,8 @@ class YoloeDetectionServiceNode(Node):
                 0.0,
                 "",
                 0,
-                f"No depth image received on {self.depth_topic}. Set depth_registration:=true and verify topic publishing.",
+                f"No depth image received on {config.depth_topic}. Set depth_registration:=true "
+                "and verify topic publishing.",
             )
         if camera_info is None:
             return DetectionRunResult(
@@ -354,7 +469,7 @@ class YoloeDetectionServiceNode(Node):
                 0.0,
                 "",
                 0,
-                f"No camera info received on {self.camera_info_topic}.",
+                f"No camera info received on {config.camera_info_topic}.",
             )
 
         with self._inference_lock:
@@ -428,7 +543,7 @@ class YoloeDetectionServiceNode(Node):
         now_msg = self.get_clock().now().to_msg()
 
         entries: list[DetectionEntry] = []
-        frame_map: dict[str, np.ndarray] = {}
+        frame_map: dict[str, PublishedTFEntry] = {}
         per_class_count: dict[str, int] = {}
         skipped_count = 0
 
@@ -459,7 +574,9 @@ class YoloeDetectionServiceNode(Node):
                 ],
                 dtype=np.float64,
             )
-            point_in_camera = self._transform_point_to_camera_link(point_in_depth, depth_frame)
+            point_in_camera = self._transform_point_to_frame(
+                point_in_depth, depth_frame, config.camera_link_frame
+            )
             if point_in_camera is None:
                 skipped_count += 1
                 continue
@@ -474,7 +591,7 @@ class YoloeDetectionServiceNode(Node):
                 child_frame = f"{class_slug}_{class_count}"
 
             pose_msg = PoseStamped()
-            pose_msg.header.frame_id = self.camera_link_frame
+            pose_msg.header.frame_id = config.camera_link_frame
             pose_msg.header.stamp = now_msg
             pose_msg.pose.position.x = float(point_in_camera[0])
             pose_msg.pose.position.y = float(point_in_camera[1])
@@ -482,9 +599,12 @@ class YoloeDetectionServiceNode(Node):
             pose_msg.pose.orientation.w = 1.0
 
             self._pose_pub.publish(pose_msg)
-            self._publish_tf(child_frame, point_in_camera)
+            self._publish_tf(child_frame, point_in_camera, config.camera_link_frame)
 
-            frame_map[child_frame] = point_in_camera.copy()
+            frame_map[child_frame] = PublishedTFEntry(
+                parent_frame=config.camera_link_frame,
+                translation=point_in_camera.copy(),
+            )
             entries.append(DetectionEntry(class_name, confidence, pose_msg, child_frame))
 
         self._set_last_tfs(frame_map)
@@ -521,22 +641,35 @@ class YoloeDetectionServiceNode(Node):
             if not self._last_tf_map:
                 return
             frame_items = [
-                (child, translation.copy()) for child, translation in self._last_tf_map.items()
+                (
+                    child,
+                    PublishedTFEntry(
+                        parent_frame=entry.parent_frame,
+                        translation=entry.translation.copy(),
+                    ),
+                )
+                for child, entry in self._last_tf_map.items()
             ]
 
-        for child_frame, translation in frame_items:
-            self._publish_tf(child_frame, translation)
+        for child_frame, entry in frame_items:
+            self._publish_tf(child_frame, entry.translation, entry.parent_frame)
 
-    def _set_last_tfs(self, frame_map: dict[str, np.ndarray]) -> None:
+    def _set_last_tfs(self, frame_map: dict[str, PublishedTFEntry]) -> None:
         with self._lock:
             self._last_tf_map = {
-                child: translation.copy() for child, translation in frame_map.items()
+                child: PublishedTFEntry(
+                    parent_frame=entry.parent_frame,
+                    translation=entry.translation.copy(),
+                )
+                for child, entry in frame_map.items()
             }
 
-    def _publish_tf(self, child_frame: str, translation: np.ndarray) -> None:
+    def _publish_tf(
+        self, child_frame: str, translation: np.ndarray, parent_frame: str
+    ) -> None:
         tf_msg = TransformStamped()
         tf_msg.header.stamp = self.get_clock().now().to_msg()
-        tf_msg.header.frame_id = self.camera_link_frame
+        tf_msg.header.frame_id = parent_frame
         tf_msg.child_frame_id = child_frame
         tf_msg.transform.translation.x = float(translation[0])
         tf_msg.transform.translation.y = float(translation[1])
@@ -544,22 +677,20 @@ class YoloeDetectionServiceNode(Node):
         tf_msg.transform.rotation.w = 1.0
         self._tf_broadcaster.sendTransform(tf_msg)
 
-    def _transform_point_to_camera_link(
-        self, point_in_source: np.ndarray, source_frame: str
+    def _transform_point_to_frame(
+        self, point_in_source: np.ndarray, source_frame: str, target_frame: str
     ) -> np.ndarray | None:
-        if source_frame == self.camera_link_frame or source_frame == "":
+        if source_frame == target_frame or source_frame == "":
             return point_in_source
 
         try:
             transform = self._tf_buffer.lookup_transform(
-                self.camera_link_frame,
+                target_frame,
                 source_frame,
                 Time(),
             )
         except TransformException as exc:
-            self.get_logger().warn(
-                f"TF lookup failed ({source_frame} -> {self.camera_link_frame}): {exc}"
-            )
+            self.get_logger().warn(f"TF lookup failed ({source_frame} -> {target_frame}): {exc}")
             return None
 
         rotation = transform.transform.rotation
@@ -576,6 +707,18 @@ class YoloeDetectionServiceNode(Node):
             [translation.x, translation.y, translation.z], dtype=np.float64
         )
         return transformed
+
+    def _resolve_camera_name(self, requested_camera_name: str) -> str:
+        camera_name = self._normalize_camera_name(requested_camera_name)
+        if not camera_name:
+            return self.default_camera_name
+        if camera_name not in self._camera_configs:
+            supported = ", ".join(sorted(self._camera_configs))
+            raise ValueError(
+                f"Unsupported camera_name '{requested_camera_name}'. Supported camera_name values: "
+                f"{supported}."
+            )
+        return camera_name
 
     @staticmethod
     def _rotate_vector_by_quaternion(
@@ -673,6 +816,15 @@ class YoloeDetectionServiceNode(Node):
     def _slug(text: str) -> str:
         slug = re.sub(r"[^a-zA-Z0-9_]+", "_", text).strip("_").lower()
         return slug or "object"
+
+    @staticmethod
+    def _normalize_camera_name(camera_name: str) -> str:
+        return camera_name.strip().lower()
+
+    @staticmethod
+    def _coalesce_non_empty(value: str, fallback: str) -> str:
+        stripped = value.strip()
+        return stripped if stripped else fallback.strip()
 
     @staticmethod
     def _class_name(names: Any, class_id: int) -> str:

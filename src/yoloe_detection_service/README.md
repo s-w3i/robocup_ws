@@ -12,6 +12,7 @@ Request:
 ```text
 string prompt_text   # e.g. "bottle" or "cup,bottle"
 bool save_image
+string camera_name   # optional: "camera0" or "camera"; empty uses server default
 ```
 
 Response includes arrays for all valid detections:
@@ -25,9 +26,13 @@ and `detections_in_frame`, `tf_published_count`, `saved_image_path`, `inference_
 
 ## Camera topics (default)
 
-- Color: `/camera/color/image_raw`
-- Depth: `/camera/depth/image_raw`
-- Camera info: `/camera/color/camera_info`
+- Default request fallback: `camera0`
+- `camera0` color: `/camera0/color/image_raw`
+- `camera0` depth: `/camera0/realsense_splitter_node/output/depth`
+- `camera0` camera info: `/camera0/color/camera_info`
+- `camera` color: `/camera/color/image_raw`
+- `camera` depth: `/camera/depth/image_raw`
+- `camera` camera info: `/camera/color/camera_info`
 
 ## Build
 
@@ -59,7 +64,13 @@ ros2 launch yoloe_detection_service yoloe_detection_service.launch.py \
 ```bash
 source /opt/ros/humble/setup.bash
 source /home/usern/robocup_ws/install/setup.bash
-ros2 service call /yoloe/detect_prompt yoloe_detection_interfaces/srv/DetectObjectPrompt "{prompt_text: 'bottle', save_image: true}"
+ros2 service call /yoloe/detect_prompt yoloe_detection_interfaces/srv/DetectObjectPrompt "{prompt_text: 'bottle', save_image: true, camera_name: 'camera0'}"
+```
+
+Use the Orbbec DaBai stream:
+
+```bash
+ros2 service call /yoloe/detect_prompt yoloe_detection_interfaces/srv/DetectObjectPrompt "{prompt_text: 'bottle', save_image: true, camera_name: 'camera'}"
 ```
 
 Tracking service `/yoloe/set_tracking` is now provided by the `deepstream_people_tracking` package.
