@@ -18,6 +18,7 @@ ROS2 Coqui TTS nodes:
   - Service: `/get_command` (`std_srvs/srv/Trigger`)
   - Subscribes: `/robot_status` (`std_msgs/msg/String`)
   - Transcription language is fixed to English (`en`)
+  - Auto-calibrates its VAD from 10 seconds of ambient startup audio by default
   - Wake-word mode only when robot status is `sleep`
   - On wake word (`hi eva` by default): requests robot status `idle`
   - On `/get_command`: sets status to `listening`, returns transcript in `response.message`, then sets status back to `idle`
@@ -90,6 +91,19 @@ source /home/usern/robocup_ws/install/setup.bash
 ros2 run coqui_tts_service whisper_command_node
 ```
 
+By default, the node records 10 seconds of ambient audio at startup and auto-tunes:
+
+- `energy_threshold`
+- `energy_multiplier`
+- `min_rms`
+- `trigger_frames`
+- `pre_roll_seconds`
+- `min_speech_seconds`
+- `silence_seconds`
+
+Keep the room quiet during those first 10 seconds for the best calibration.
+Any positive value overrides the auto-tuned value for that one parameter. `0` keeps auto mode.
+
 Run full voice interaction stack:
 
 ```bash
@@ -103,8 +117,19 @@ Override wake word / service timeout:
 ros2 run coqui_tts_service whisper_command_node --ros-args \
   -p awake_word:="hi eva" \
   -p get_command_timeout_sec:=12.0 \
+  -p calibration_seconds:=10.0 \
   -p whisper_device:=auto \
-  -p model:=base
+  -p model:=medium
+```
+
+Example with manual VAD overrides:
+
+```bash
+ros2 run coqui_tts_service whisper_command_node --ros-args \
+  -p calibration_seconds:=10.0 \
+  -p min_rms:=70.0 \
+  -p trigger_frames:=1 \
+  -p pre_roll_seconds:=0.6
 ```
 
 Set status:

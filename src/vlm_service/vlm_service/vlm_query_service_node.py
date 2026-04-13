@@ -41,6 +41,7 @@ DUAL_RESPONSE_SCHEMA: dict[str, Any] = {
 class CameraFrame:
     image_bgr: Any
     stamp_ns: int
+    received_monotonic: float
 
 
 @dataclass
@@ -191,7 +192,11 @@ class VlmQueryServiceNode(Node):
 
         stamp_ns = int(msg.header.stamp.sec) * 1_000_000_000 + int(msg.header.stamp.nanosec)
         with self._lock:
-            self._frames[camera_name] = CameraFrame(image_bgr=image, stamp_ns=stamp_ns)
+            self._frames[camera_name] = CameraFrame(
+                image_bgr=image,
+                stamp_ns=stamp_ns,
+                received_monotonic=time.monotonic(),
+            )
 
     def _handle_query(
         self, request: VlmQuery.Request, response: VlmQuery.Response
@@ -207,6 +212,7 @@ class VlmQueryServiceNode(Node):
 
         thinking_state_set = False
         request_started = time.time()
+        request_started_monotonic = time.monotonic()
         try:
             reasoning_mode = self._normalize_reasoning_mode(request.reasoning_mode)
             response.reasoning_mode_used = reasoning_mode
@@ -229,10 +235,13 @@ class VlmQueryServiceNode(Node):
             use_vision = bool(request.need_image)
             if bool(request.need_image):
                 camera_name = str(request.camera_name).strip() or self.default_camera_name
-                frame = self._wait_for_frame(camera_name)
+                frame = self._wait_for_frame(
+                    camera_name,
+                    min_received_monotonic=request_started_monotonic,
+                )
                 if frame is None:
                     response.message = (
-                        f"No image available from camera '{camera_name}'. "
+                        f"No fresh image available from camera '{camera_name}'. "
                         "Check the camera topic or increase image_wait_timeout_sec."
                     )
                     return response
@@ -286,7 +295,11 @@ class VlmQueryServiceNode(Node):
             if self.manage_robot_status and thinking_state_set:
                 self._set_robot_status("idle")
 
-    def _wait_for_frame(self, camera_name: str) -> CameraFrame | None:
+    def _wait_for_frame(
+        self,
+        camera_name: str,
+        min_received_monotonic: float | None = None,
+    ) -> CameraFrame | None:
         if camera_name not in self._camera_topics_by_name:
             raise ValueError(
                 f"Unknown camera '{camera_name}'. Available cameras: {sorted(self._camera_topics_by_name)}"
@@ -297,6 +310,9 @@ class VlmQueryServiceNode(Node):
             with self._lock:
                 frame = self._frames.get(camera_name)
             if frame is not None:
+                if min_received_monotonic is not None and frame.received_monotonic < min_received_monotonic:
+                    time.sleep(0.05)
+                    continue
                 return frame
             time.sleep(0.05)
         return None

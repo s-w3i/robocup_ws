@@ -27,6 +27,8 @@ setup(
             'robot_status_node = coqui_tts_service.robot_status_node:main',
             'whisper_command_node = coqui_tts_service.whisper_command_node:main',
             'ollama_chatbot_node = coqui_tts_service.ollama_chatbot_node:main',
+            'home_assistant_orchestrator_node = coqui_tts_service.home_assistant_orchestrator_node:main',
+            'nanobot_voice_agent_node = coqui_tts_service.nanobot_voice_agent_node:main',
         ],
     },
 )

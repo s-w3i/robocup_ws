@@ -9,6 +9,8 @@
 
   <depend>rclpy</depend>
   <depend>coqui_tts_interfaces</depend>
+  <depend>vlm_interfaces</depend>
+  <depend>yoloe_detection_interfaces</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
   <exec_depend>python3-requests</exec_depend>

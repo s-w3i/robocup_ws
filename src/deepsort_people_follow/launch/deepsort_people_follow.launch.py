@@ -1,5 +1,6 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -26,8 +27,8 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("enable_open_vocab_prompt", default_value="false"),
         DeclareLaunchArgument("patch_torchvision_nms_cpu_fallback", default_value="true"),
         DeclareLaunchArgument("prefer_ultralytics_torch_nms", default_value="true"),
-        DeclareLaunchArgument("max_age", default_value="30"),
-        DeclareLaunchArgument("n_init", default_value="3"),
+        DeclareLaunchArgument("max_age", default_value="3000"),
+        DeclareLaunchArgument("n_init", default_value="10"),
         DeclareLaunchArgument("max_cosine_distance", default_value="0.25"),
         DeclareLaunchArgument("nn_budget", default_value="100"),
         DeclareLaunchArgument("nms_max_overlap", default_value="1.0"),
@@ -56,6 +57,26 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("reacquire_max_vel_mps", default_value="1.5"),
         DeclareLaunchArgument("motion_weight", default_value="0.4"),
         DeclareLaunchArgument("diagnostics_period_s", default_value="1.0"),
+        DeclareLaunchArgument("launch_nav2_bridge", default_value="true"),
+        DeclareLaunchArgument("nav2_bridge_enabled", default_value="false"),
+        DeclareLaunchArgument("nav2_bridge_global_frame", default_value="map"),
+        DeclareLaunchArgument("nav2_bridge_robot_base_frame", default_value="base_footprint"),
+        DeclareLaunchArgument("nav2_bridge_tracked_frame", default_value="follow_target"),
+        DeclareLaunchArgument("nav2_bridge_goal_update_topic", default_value="/goal_update"),
+        DeclareLaunchArgument("nav2_bridge_navigate_to_pose_action", default_value="/navigate_to_pose"),
+        DeclareLaunchArgument("nav2_bridge_enable_service_name", default_value="/people_follow_nav2/set_enabled"),
+        DeclareLaunchArgument("nav2_bridge_goal_update_rate_hz", default_value="5.0"),
+        DeclareLaunchArgument("nav2_bridge_transform_timeout_s", default_value="0.2"),
+        DeclareLaunchArgument("nav2_bridge_target_lost_timeout_s", default_value="2.0"),
+        DeclareLaunchArgument(
+            "nav2_bridge_behavior_tree_path",
+            default_value="/home/usern/robocup_ws/src/deepsort_people_follow/bt/follower_w_recovery.xml",
+        ),
+        DeclareLaunchArgument("nav2_bridge_behavior_tree_package", default_value="deepsort_people_follow"),
+        DeclareLaunchArgument(
+            "nav2_bridge_behavior_tree_relative_path",
+            default_value="bt/follower_w_recovery.xml",
+        ),
     ]
 
     node = Node(
@@ -116,4 +137,29 @@ def generate_launch_description() -> LaunchDescription:
         ],
     )
 
-    return LaunchDescription(args + [node])
+    nav2_bridge_node = Node(
+        package="deepsort_people_follow",
+        executable="people_follow_nav2_bridge",
+        name="people_follow_nav2_bridge",
+        output="screen",
+        condition=IfCondition(LaunchConfiguration("launch_nav2_bridge")),
+        parameters=[
+            {
+                "enabled": LaunchConfiguration("nav2_bridge_enabled"),
+                "global_frame": LaunchConfiguration("nav2_bridge_global_frame"),
+                "robot_base_frame": LaunchConfiguration("nav2_bridge_robot_base_frame"),
+                "tracked_frame": LaunchConfiguration("nav2_bridge_tracked_frame"),
+                "goal_update_topic": LaunchConfiguration("nav2_bridge_goal_update_topic"),
+                "navigate_to_pose_action": LaunchConfiguration("nav2_bridge_navigate_to_pose_action"),
+                "enable_service_name": LaunchConfiguration("nav2_bridge_enable_service_name"),
+                "goal_update_rate_hz": LaunchConfiguration("nav2_bridge_goal_update_rate_hz"),
+                "transform_timeout_s": LaunchConfiguration("nav2_bridge_transform_timeout_s"),
+                "target_lost_timeout_s": LaunchConfiguration("nav2_bridge_target_lost_timeout_s"),
+                "behavior_tree_path": LaunchConfiguration("nav2_bridge_behavior_tree_path"),
+                "behavior_tree_package": LaunchConfiguration("nav2_bridge_behavior_tree_package"),
+                "behavior_tree_relative_path": LaunchConfiguration("nav2_bridge_behavior_tree_relative_path"),
+            }
+        ],
+    )
+
+    return LaunchDescription(args + [node, nav2_bridge_node])

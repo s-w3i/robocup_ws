@@ -107,6 +107,12 @@ class DetectionRunResult:
     saved_image_path: str
 
 
+@dataclass
+class PublishedTFEntry:
+    parent_frame: str
+    translation: np.ndarray
+
+
 def inject_known_site_packages() -> None:
     """Add known site-packages paths for mixed-venv deployments."""
     candidates = [
@@ -125,13 +131,17 @@ class YoloePointedDetectionServiceNode(Node):
         super().__init__("yoloe_pointed_detection_service_node")
 
         self.declare_parameter("service_name", "/yoloe/detect_pointed_prompt")
-        self.declare_parameter("model_path", "/home/usern/yoloe-26l-seg.pt")
+        self.declare_parameter("model_path", "/home/usern/Kevin_yolo/yolo26l-seg_bag.pt")
+        self.declare_parameter(
+            "bag_prompt_aliases", ["bag", "paper bag", "brown paper bag", "paper bags"]
+        )
         self.declare_parameter("device", "auto")
         self.declare_parameter("imgsz", 640)
         self.declare_parameter("conf", 0.25)
         self.declare_parameter("iou", 0.45)
         self.declare_parameter("max_det", 200)
         self.declare_parameter("force_torch_nms", True)
+        self.declare_parameter("tf_republish_hz", 10.0)
 
         self.declare_parameter("color_topic", "/camera0/color/image_raw")
         self.declare_parameter("depth_topic", "/camera0/depth/image_rect_raw")
@@ -170,12 +180,18 @@ class YoloePointedDetectionServiceNode(Node):
 
         self.service_name = str(self.get_parameter("service_name").value)
         self.model_path = str(self.get_parameter("model_path").value)
+        self.bag_prompt_aliases = tuple(
+            self._normalize_class_label(str(value))
+            for value in self.get_parameter("bag_prompt_aliases").value
+            if self._normalize_class_label(str(value))
+        )
         self.device_request = str(self.get_parameter("device").value)
         self.imgsz = int(self.get_parameter("imgsz").value)
         self.conf = float(self.get_parameter("conf").value)
         self.iou = float(self.get_parameter("iou").value)
         self.max_det = int(self.get_parameter("max_det").value)
         self.force_torch_nms = bool(self.get_parameter("force_torch_nms").value)
+        self.tf_republish_hz = max(0.5, float(self.get_parameter("tf_republish_hz").value))
 
         self.color_topic = str(self.get_parameter("color_topic").value)
         self.depth_topic = str(self.get_parameter("depth_topic").value)
@@ -224,6 +240,7 @@ class YoloePointedDetectionServiceNode(Node):
         self._bridge = CvBridge()
         self._lock = threading.Lock()
         self._inference_lock = threading.Lock()
+        self._tf_publish_lock = threading.Lock()
         self._ui_failed = False
 
         self._latest_color_image: np.ndarray | None = None
@@ -236,6 +253,8 @@ class YoloePointedDetectionServiceNode(Node):
 
         self._model: Any = None
         self._prompt_key: tuple[str, ...] | None = None
+        self._supports_prompt_classes = False
+        self._active_tf_map: dict[str, PublishedTFEntry] = {}
         self._device: str = "cpu"
 
         self._mp_hands = mp.solutions.hands
@@ -272,6 +291,7 @@ class YoloePointedDetectionServiceNode(Node):
         self.create_subscription(Image, self.depth_topic, self._on_depth_image, qos_profile_sensor_data)
         self.create_subscription(CameraInfo, self.camera_info_topic, self._on_camera_info, qos_profile_sensor_data)
         self.create_service(DetectObjectPrompt, self.service_name, self._handle_detect_request)
+        self.create_timer(1.0 / self.tf_republish_hz, self._publish_active_tfs)
 
         self._load_model()
 
@@ -281,6 +301,7 @@ class YoloePointedDetectionServiceNode(Node):
         self.get_logger().info(f"Color topic: {self.color_topic}")
         self.get_logger().info(f"Depth topic: {self.depth_topic}")
         self.get_logger().info(f"Camera info topic: {self.camera_info_topic}")
+        self.get_logger().info(f"TF republish rate: {self.tf_republish_hz:.1f} Hz")
         self.get_logger().info(
             f"Hybrid pointing cues enabled: hand_cone={self.pointing_max_angle_deg:.1f} deg, "
             f"arm_cone={self.arm_pointing_max_angle_deg:.1f} deg"
@@ -297,14 +318,24 @@ class YoloePointedDetectionServiceNode(Node):
 
         import torch
         from ultralytics import YOLOE
+        from ultralytics.nn.tasks import YOLOEModel
 
         self._device = self._choose_device(self.device_request, torch)
 
         started = time.perf_counter()
         self._model = YOLOE(self.model_path)
+        self._supports_prompt_classes = isinstance(self._model.model, YOLOEModel)
         elapsed_s = time.perf_counter() - started
         self.get_logger().info(f"Loaded YOLOE model in {elapsed_s:.2f}s")
         self.get_logger().info(f"Torch CUDA available: {torch.cuda.is_available()}")
+        if self._supports_prompt_classes:
+            self.get_logger().info("Pointed model supports YOLOE text prompts.")
+        else:
+            fixed_classes = ", ".join(str(name) for name in self._model.names.values())
+            self.get_logger().info(
+                "Pointed service is running with a fixed-class model. "
+                f"Built-in labels: {fixed_classes}"
+            )
 
     @staticmethod
     def _choose_device(requested: str, torch_module: Any) -> str:
@@ -361,6 +392,13 @@ class YoloePointedDetectionServiceNode(Node):
             response.message = str(exc)
             return response
 
+        if not self._is_bag_request(prompts):
+            response.message = (
+                "This pointed detection service is configured for paper bag only. "
+                "Use prompt_text like 'brown paper bag' or 'paper bag'."
+            )
+            return response
+
         run_result = self._run_detection(prompts, request.save_image)
         response.detections_in_frame = run_result.detections_in_frame
         response.tf_published_count = run_result.tf_published_count
@@ -385,11 +423,18 @@ class YoloePointedDetectionServiceNode(Node):
         with self._inference_lock:
             if prompt_key != self._prompt_key:
                 started = time.perf_counter()
-                self._model.set_classes(prompts)
+                if self._supports_prompt_classes:
+                    self._model.set_classes(prompts)
+                else:
+                    fixed_classes = ", ".join(str(name) for name in self._model.names.values())
+                    self.get_logger().info(
+                        "Fixed-class pointed model active; prompt '%s' will match against: %s"
+                        % (", ".join(prompts), fixed_classes)
+                    )
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
                 self._prompt_key = prompt_key
                 self.get_logger().info(
-                    f"Updated prompt classes ({', '.join(prompts)}) in {elapsed_ms:.1f} ms"
+                    f"Prepared prompt classes ({', '.join(prompts)}) in {elapsed_ms:.1f} ms"
                 )
 
         frame_decisions: list[FrameDecision] = []
@@ -1283,10 +1328,38 @@ class YoloePointedDetectionServiceNode(Node):
             tipLength=0.06,
         )
 
+    def _publish_active_tfs(self) -> None:
+        with self._tf_publish_lock:
+            if not self._active_tf_map:
+                return
+            frame_items = [
+                (
+                    child_frame,
+                    PublishedTFEntry(
+                        parent_frame=entry.parent_frame,
+                        translation=entry.translation.copy(),
+                    ),
+                )
+                for child_frame, entry in self._active_tf_map.items()
+            ]
+
+        for child_frame, entry in frame_items:
+            self._send_tf_transform(child_frame, entry.translation, entry.parent_frame)
+
     def _publish_tf(self, child_frame: str, translation: np.ndarray) -> None:
+        with self._tf_publish_lock:
+            self._active_tf_map[child_frame] = PublishedTFEntry(
+                parent_frame=self.camera_link_frame,
+                translation=translation.copy(),
+            )
+        self._send_tf_transform(child_frame, translation, self.camera_link_frame)
+
+    def _send_tf_transform(
+        self, child_frame: str, translation: np.ndarray, parent_frame: str
+    ) -> None:
         tf_msg = TransformStamped()
         tf_msg.header.stamp = self.get_clock().now().to_msg()
-        tf_msg.header.frame_id = self.camera_link_frame
+        tf_msg.header.frame_id = parent_frame
         tf_msg.child_frame_id = child_frame
         tf_msg.transform.translation.x = float(translation[0])
         tf_msg.transform.translation.y = float(translation[1])
@@ -1422,6 +1495,16 @@ class YoloePointedDetectionServiceNode(Node):
     def _slug(text: str) -> str:
         slug = re.sub(r"[^a-zA-Z0-9_]+", "_", text).strip("_").lower()
         return slug or "object"
+
+    @staticmethod
+    def _normalize_class_label(text: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", text.casefold()).strip()
+
+    def _is_bag_prompt(self, prompt: str) -> bool:
+        return self._normalize_class_label(prompt) in self.bag_prompt_aliases
+
+    def _is_bag_request(self, prompts: list[str]) -> bool:
+        return bool(prompts) and all(self._is_bag_prompt(prompt) for prompt in prompts)
 
     @staticmethod
     def _class_name(names: Any, class_id: int) -> str:

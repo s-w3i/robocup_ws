@@ -9,8 +9,9 @@ def generate_launch_description() -> LaunchDescription:
     coqui_site = "/home/usern/coqui-venv/lib/python3.10/site-packages"
 
     args = [
-        DeclareLaunchArgument("model_path", default_value="/home/usern/yoloe-26l-seg.pt"),
+        DeclareLaunchArgument("model_path", default_value="/home/usern/Kevin_yolo/yolo26l-seg_bag.pt"),
         DeclareLaunchArgument("device", default_value="auto"),
+        DeclareLaunchArgument("tf_republish_hz", default_value="10.0"),
         DeclareLaunchArgument("service_name", default_value="/yoloe/detect_pointed_prompt"),
         DeclareLaunchArgument("color_topic", default_value="/camera0/color/image_raw"),
         DeclareLaunchArgument("depth_topic", default_value="/camera0/depth/image_rect_raw"),
@@ -51,6 +52,7 @@ def generate_launch_description() -> LaunchDescription:
             {
                 "model_path": LaunchConfiguration("model_path"),
                 "device": LaunchConfiguration("device"),
+                "tf_republish_hz": LaunchConfiguration("tf_republish_hz"),
                 "service_name": LaunchConfiguration("service_name"),
                 "color_topic": LaunchConfiguration("color_topic"),
                 "depth_topic": LaunchConfiguration("depth_topic"),

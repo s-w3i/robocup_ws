@@ -8,8 +8,11 @@
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
+  <depend>ament_index_python</depend>
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
+  <depend>nav2_msgs</depend>
+  <depend>std_srvs</depend>
   <depend>tf2_ros</depend>
   <depend>cv_bridge</depend>
   <depend>yoloe_detection_interfaces</depend>

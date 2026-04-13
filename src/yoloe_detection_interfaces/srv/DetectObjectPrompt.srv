@@ -1,5 +1,6 @@
 string prompt_text
 bool save_image
+string camera_name
 ---
 bool success
 string message

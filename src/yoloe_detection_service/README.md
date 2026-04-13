@@ -15,14 +15,27 @@ bool save_image
 string camera_name   # optional: "camera0" or "camera"; empty uses server default
 ```
 
-Response includes arrays for all valid detections:
+Response includes arrays with at most one valid detection: the highest-confidence detection
+that also has valid depth/TF:
 
 - `detected_classes[]`
 - `confidences[]`
 - `poses_camera_link[]`
-- `tf_child_frames[]` (e.g. `chair_1`, `chair_2`)
+- `tf_child_frames[]` (e.g. `chair_1`)
 
-and `detections_in_frame`, `tf_published_count`, `saved_image_path`, `inference_ms`.
+The service definition still uses arrays, but only index `0` is populated when a valid result
+is available. The response also includes `detections_in_frame`, `tf_published_count`,
+`saved_image_path`, and `inference_ms`.
+
+Model behavior:
+
+- Default model path is `/home/usern/yoloe-26l-seg.pt`.
+- Bag-specific model path is `/home/usern/Kevin_yolo/yolo26l-seg_bag.pt`.
+- Bag-only prompts such as `bag`, `paper bag`, and `brown paper bag` temporarily switch to
+  the bag-specific model for that request, then unload it after detection.
+- All other prompts stay on the default YOLOE model.
+- Fixed-class YOLO/segmentation checkpoints use `prompt_text` only as a class-name filter
+  against the checkpoint's built-in labels.
 
 ## Camera topics (default)
 
@@ -84,8 +97,11 @@ Behavior:
 
 - One inference per service request.
 - Uses MediaPipe hand landmarks to detect left/right pointing gesture.
-- Runs YOLOE with request prompt text.
+- Uses the paper bag model `/home/usern/Kevin_yolo/yolo26l-seg_bag.pt`.
+- Accepts bag-only prompts such as `bag`, `paper bag`, or `brown paper bag`.
 - Returns only the object aligned with pointing ray (single centroid pose in `poses_camera_link[0]`).
+- Republishes the last successful TF continuously until the same child frame is updated by a
+  newer successful detection.
 - Publishes result UI image on `/yoloe/pointing_result_image` and optional OpenCV window.
 
 Run:
@@ -102,7 +118,7 @@ Call with ROS2 CLI:
 ```bash
 source /opt/ros/humble/setup.bash
 source /home/usern/robocup_ws/install/setup.bash
-ros2 service call /yoloe/detect_pointed_prompt yoloe_detection_interfaces/srv/DetectObjectPrompt "{prompt_text: 'bottle', save_image: true}"
+ros2 service call /yoloe/detect_pointed_prompt yoloe_detection_interfaces/srv/DetectObjectPrompt "{prompt_text: 'brown paper bag', save_image: true}"
 ```
 
 ## VLM Alternative Pointed Service (YOLOE + Ollama VLM, VLM-Only Decision)

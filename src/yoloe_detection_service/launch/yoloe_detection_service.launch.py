@@ -8,6 +8,7 @@ def generate_launch_description() -> LaunchDescription:
     default_site_packages = "/home/usern/coqui-venv/lib/python3.10/site-packages"
     args = [
         DeclareLaunchArgument("model_path", default_value="/home/usern/yoloe-26l-seg.pt"),
+        DeclareLaunchArgument("bag_model_path", default_value="/home/usern/Kevin_yolo/yolo26l-seg_bag.pt"),
         DeclareLaunchArgument("device", default_value="auto"),
         DeclareLaunchArgument("service_name", default_value="/yoloe/detect_prompt"),
         DeclareLaunchArgument("default_camera_name", default_value="camera0"),
@@ -62,6 +63,7 @@ def generate_launch_description() -> LaunchDescription:
         parameters=[
             {
                 "model_path": LaunchConfiguration("model_path"),
+                "bag_model_path": LaunchConfiguration("bag_model_path"),
                 "device": LaunchConfiguration("device"),
                 "service_name": LaunchConfiguration("service_name"),
                 "default_camera_name": LaunchConfiguration("default_camera_name"),

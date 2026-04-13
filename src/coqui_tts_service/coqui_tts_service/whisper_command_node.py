@@ -75,6 +75,27 @@ class PendingCommand:
     text: str = ""
 
 
+@dataclass(frozen=True)
+class CalibrationStats:
+    median_rms: float
+    p90_rms: float
+    p95_rms: float
+    p99_rms: float
+    robust_sigma: float
+
+
+@dataclass(frozen=True)
+class SegmenterTuning:
+    noise_rms: float
+    threshold: float
+    min_rms: float
+    energy_multiplier: float
+    trigger_frames: int
+    silence_seconds: float
+    pre_roll_seconds: float
+    min_speech_seconds: float
+
+
 class EnergySegmenter:
     def __init__(
         self,
@@ -92,18 +113,66 @@ class EnergySegmenter:
         self.rate = rate
         self.frame_ms = frame_ms
         self.frame_s = frame_ms / 1000.0
-        self.silence_frames = max(1, int(round(silence_seconds / self.frame_s)))
-        self.min_speech_seconds = max(0.05, min_speech_seconds)
-        self.trigger_frames = max(1, trigger_frames)
-
+        self._manual_silence_seconds = silence_seconds if silence_seconds > 0 else None
+        self._manual_pre_roll_seconds = pre_roll_seconds if pre_roll_seconds > 0 else None
+        self._manual_min_speech_seconds = min_speech_seconds if min_speech_seconds > 0 else None
+        self._manual_trigger_frames = trigger_frames if trigger_frames > 0 else None
         self.fixed_threshold = energy_threshold if energy_threshold > 0 else None
-        self.energy_multiplier = max(1.0, energy_multiplier)
-        self.min_rms = max(1.0, min_rms)
-        self.pre_roll = deque(maxlen=max(1, int(round(pre_roll_seconds / self.frame_s))))
-        self.calibration_target_frames = max(0, int(round(calibration_seconds / self.frame_s)))
+        self._manual_energy_multiplier = energy_multiplier if energy_multiplier > 0 else None
+        self._manual_min_rms = min_rms if min_rms > 0 else None
+        self.calibration_seconds = max(0.0, calibration_seconds)
+        self._auto_calibration_enabled = any(
+            value is None
+            for value in (
+                self._manual_silence_seconds,
+                self._manual_pre_roll_seconds,
+                self._manual_min_speech_seconds,
+                self._manual_trigger_frames,
+                self._manual_energy_multiplier,
+                self._manual_min_rms,
+            )
+        ) or self.fixed_threshold is None
+
+        self.silence_frames = max(
+            1,
+            int(
+                round(
+                    (self._manual_silence_seconds or 0.8)
+                    / self.frame_s
+                )
+            ),
+        )
+        self.min_speech_seconds = max(0.05, self._manual_min_speech_seconds or 0.25)
+        self.trigger_frames = max(1, self._manual_trigger_frames or 1)
+        self.energy_multiplier = max(1.0, self._manual_energy_multiplier or 1.1)
+        self.min_rms = max(1.0, self._manual_min_rms or 1.0)
+        self.pre_roll = deque(
+            maxlen=max(1, int(round((self._manual_pre_roll_seconds or 0.6) / self.frame_s)))
+        )
+        self.calibration_target_frames = max(0, int(round(self.calibration_seconds / self.frame_s)))
         self.calibration_values: list[float] = []
         self.noise_rms: float | None = None
-        self.calibration_done = self.fixed_threshold is not None or self.calibration_target_frames == 0
+        self.calibration_stats: CalibrationStats | None = None
+        self.tuning: SegmenterTuning | None = None
+        self.calibration_done = (
+            not self._auto_calibration_enabled or self.calibration_target_frames == 0
+        )
+        if self.calibration_done:
+            noise_rms = max(1.0, self.min_rms)
+            threshold = self.fixed_threshold if self.fixed_threshold is not None else max(
+                self.min_rms, noise_rms * self.energy_multiplier
+            )
+            self.noise_rms = noise_rms
+            self.tuning = SegmenterTuning(
+                noise_rms=noise_rms,
+                threshold=threshold,
+                min_rms=self.min_rms,
+                energy_multiplier=self.energy_multiplier,
+                trigger_frames=self.trigger_frames,
+                silence_seconds=self.silence_frames * self.frame_s,
+                pre_roll_seconds=self.pre_roll.maxlen * self.frame_s,
+                min_speech_seconds=self.min_speech_seconds,
+            )
 
         self.in_speech = False
         self.speech_run = 0
@@ -112,9 +181,125 @@ class EnergySegmenter:
         self.segment_start_time = 0.0
 
     @staticmethod
+    def _clamp(value: float, lower: float, upper: float) -> float:
+        return max(lower, min(upper, value))
+
+    @staticmethod
     def rms(frame: np.ndarray) -> float:
         x = frame.astype(np.float32)
         return float(np.sqrt(np.mean(x * x)))
+
+    @staticmethod
+    def _build_stats(values: list[float]) -> CalibrationStats:
+        arr = np.asarray(values, dtype=np.float32)
+        median = float(np.median(arr))
+        p90, p95, p99 = np.percentile(arr, [90, 95, 99]).astype(float)
+        mad = float(np.median(np.abs(arr - median)))
+        robust_sigma = max(1.0, 1.4826 * mad)
+        return CalibrationStats(
+            median_rms=max(1.0, median),
+            p90_rms=max(1.0, p90),
+            p95_rms=max(1.0, p95),
+            p99_rms=max(1.0, p99),
+            robust_sigma=robust_sigma,
+        )
+
+    def needs_calibration_audio(self) -> bool:
+        return self._auto_calibration_enabled and not self.calibration_done
+
+    def _derive_auto_tuning(self, stats: CalibrationStats) -> SegmenterTuning:
+        noise_rms = max(1.0, stats.median_rms)
+        transient_ratio = stats.p99_rms / max(noise_rms, 1.0)
+        variability = stats.robust_sigma / max(noise_rms, 1.0)
+        auto_threshold = max(
+            noise_rms + 3.0 * stats.robust_sigma,
+            stats.p95_rms + 1.5 * stats.robust_sigma,
+            stats.p99_rms * 1.05,
+            noise_rms * 1.12,
+        )
+        threshold = (
+            self.fixed_threshold
+            if self.fixed_threshold is not None
+            else self._clamp(auto_threshold, noise_rms * 1.05, noise_rms * 3.5)
+        )
+        min_rms = (
+            max(1.0, self._manual_min_rms)
+            if self._manual_min_rms is not None
+            else max(1.0, min(threshold * 0.95, max(stats.p90_rms, noise_rms * 1.02)))
+        )
+        energy_multiplier = (
+            max(1.0, self._manual_energy_multiplier)
+            if self._manual_energy_multiplier is not None
+            else self._clamp(threshold / max(noise_rms, 1.0), 1.02, 3.5)
+        )
+
+        if self._manual_trigger_frames is not None:
+            trigger_frames = max(1, self._manual_trigger_frames)
+        elif variability > 0.18 or transient_ratio > 1.6:
+            trigger_frames = 3
+        elif variability > 0.08 or transient_ratio > 1.25:
+            trigger_frames = 2
+        else:
+            trigger_frames = 1
+
+        silence_seconds = (
+            max(self.frame_s, self._manual_silence_seconds)
+            if self._manual_silence_seconds is not None
+            else self._clamp(
+                0.55 + 0.7 * variability + 0.08 * (trigger_frames - 1),
+                0.6,
+                1.2,
+            )
+        )
+        pre_roll_seconds = (
+            max(self.frame_s, self._manual_pre_roll_seconds)
+            if self._manual_pre_roll_seconds is not None
+            else self._clamp(
+                0.42 + 0.08 * trigger_frames + 0.25 * variability,
+                0.45,
+                0.9,
+            )
+        )
+        min_speech_seconds = (
+            max(0.05, self._manual_min_speech_seconds)
+            if self._manual_min_speech_seconds is not None
+            else self._clamp(
+                0.18 + 0.06 * (trigger_frames - 1) + 0.2 * variability,
+                0.18,
+                0.45,
+            )
+        )
+
+        return SegmenterTuning(
+            noise_rms=noise_rms,
+            threshold=threshold,
+            min_rms=min_rms,
+            energy_multiplier=energy_multiplier,
+            trigger_frames=trigger_frames,
+            silence_seconds=silence_seconds,
+            pre_roll_seconds=pre_roll_seconds,
+            min_speech_seconds=min_speech_seconds,
+        )
+
+    def _apply_tuning(self, tuning: SegmenterTuning) -> None:
+        self.noise_rms = tuning.noise_rms
+        self.min_rms = max(1.0, tuning.min_rms)
+        self.energy_multiplier = max(1.0, tuning.energy_multiplier)
+        self.trigger_frames = max(1, tuning.trigger_frames)
+        self.min_speech_seconds = max(0.05, tuning.min_speech_seconds)
+        self.silence_frames = max(1, int(round(tuning.silence_seconds / self.frame_s)))
+        new_pre_roll_frames = max(1, int(round(tuning.pre_roll_seconds / self.frame_s)))
+        self.pre_roll = deque(self.pre_roll, maxlen=new_pre_roll_frames)
+        self.tuning = SegmenterTuning(
+            noise_rms=tuning.noise_rms,
+            threshold=tuning.threshold,
+            min_rms=self.min_rms,
+            energy_multiplier=self.energy_multiplier,
+            trigger_frames=self.trigger_frames,
+            silence_seconds=self.silence_frames * self.frame_s,
+            pre_roll_seconds=new_pre_roll_frames * self.frame_s,
+            min_speech_seconds=self.min_speech_seconds,
+        )
 
     def current_threshold(self) -> float:
         if self.fixed_threshold is not None:
@@ -131,18 +316,18 @@ class EnergySegmenter:
         self.noise_rms = 0.98 * self.noise_rms + 0.02 * rms
 
     def _maybe_finish_calibration(self) -> bool:
-        if self.fixed_threshold is not None:
-            self.calibration_done = True
+        if self.calibration_done:
             return True
-        if self.calibration_target_frames == 0:
-            if self.noise_rms is None:
-                self.noise_rms = self.min_rms
+        if self.calibration_target_frames == 0 or not self._auto_calibration_enabled:
+            self.calibration_stats = self._build_stats(self.calibration_values or [self.min_rms])
+            tuning = self._derive_auto_tuning(self.calibration_stats)
+            self._apply_tuning(tuning)
             self.calibration_done = True
             return True
         if len(self.calibration_values) < self.calibration_target_frames:
             return False
-        avg = float(np.mean(self.calibration_values))
-        self.noise_rms = max(1.0, avg)
+        self.calibration_stats = self._build_stats(self.calibration_values)
+        self._apply_tuning(self._derive_auto_tuning(self.calibration_stats))
         self.calibration_done = True
         return True
 
@@ -354,15 +539,15 @@ class WhisperCommandNode(Node):
         self.declare_parameter("audio_device", "default")
         self.declare_parameter("rate", 16000)
         self.declare_parameter("frame_ms", 30)
-        self.declare_parameter("silence_seconds", 1.0)
-        self.declare_parameter("pre_roll_seconds", 0.3)
-        self.declare_parameter("min_speech_seconds", 0.4)
-        self.declare_parameter("trigger_frames", 2)
+        self.declare_parameter("silence_seconds", 0.0)
+        self.declare_parameter("pre_roll_seconds", 0.0)
+        self.declare_parameter("min_speech_seconds", 0.0)
+        self.declare_parameter("trigger_frames", 0)
         self.declare_parameter("energy_threshold", 0.0)
-        self.declare_parameter("energy_multiplier", 1.0)
-        self.declare_parameter("min_rms", 120.0)
-        self.declare_parameter("calibration_seconds", 5.0)
-        self.declare_parameter("model", "small")
+        self.declare_parameter("energy_multiplier", 0.0)
+        self.declare_parameter("min_rms", 0.0)
+        self.declare_parameter("calibration_seconds", 10.0)
+        self.declare_parameter("model", "medium")
         self.declare_parameter("language", "en")
         self.declare_parameter("task", "transcribe")
         self.declare_parameter("whisper_device", "auto")
@@ -487,6 +672,11 @@ class WhisperCommandNode(Node):
             f"extra_site_packages={self.extra_site_packages} isolate_site_packages={self.isolate_site_packages} "
             f"(added={added}, removed={removed})"
         )
+        if self._segmenter.needs_calibration_audio():
+            self.get_logger().info(
+                f"Collecting {self.calibration_seconds:.1f}s of ambient audio to auto-calibrate Whisper VAD. "
+                "Keep the room quiet during startup for best results."
+            )
 
     def _build_runtime_env(self, site_packages: str) -> None:
         lib_paths: list[str] = []
@@ -626,24 +816,34 @@ class WhisperCommandNode(Node):
                     now = time.time()
                     frame = np.frombuffer(chunk, dtype=np.int16).copy()
                     should_listen = self._should_listen()
-                    if not should_listen:
+                    should_process_audio = should_listen or self._segmenter.needs_calibration_audio()
+                    if not should_process_audio:
                         if was_listening:
                             self._segmenter.reset_activity()
                             was_listening = False
                         continue
-                    was_listening = True
+                    was_listening = should_listen
 
                     started, segment, _, _ = self._segmenter.process(frame, now)
 
                     if (
-                        self.energy_threshold <= 0.0
+                        self._segmenter.calibration_stats is not None
+                        and self._segmenter.tuning is not None
                         and self._segmenter.calibration_done
                         and not announced_calibration
                     ):
-                        noise = self._segmenter.noise_rms if self._segmenter.noise_rms is not None else 0.0
-                        threshold = self._segmenter.current_threshold()
+                        stats = self._segmenter.calibration_stats
+                        tuning = self._segmenter.tuning
                         self.get_logger().info(
-                            f"Whisper VAD calibrated (noise_rms={noise:.1f}, threshold={threshold:.1f})"
+                            "Whisper VAD auto-calibrated "
+                            f"(ambient={self.calibration_seconds:.1f}s, "
+                            f"noise_rms={tuning.noise_rms:.1f}, p95={stats.p95_rms:.1f}, "
+                            f"threshold={tuning.threshold:.1f}, min_rms={tuning.min_rms:.1f}, "
+                            f"energy_multiplier={tuning.energy_multiplier:.2f}, "
+                            f"trigger_frames={tuning.trigger_frames}, "
+                            f"pre_roll={tuning.pre_roll_seconds:.2f}s, "
+                            f"min_speech={tuning.min_speech_seconds:.2f}s, "
+                            f"silence={tuning.silence_seconds:.2f}s)"
                         )
                         announced_calibration = True
 

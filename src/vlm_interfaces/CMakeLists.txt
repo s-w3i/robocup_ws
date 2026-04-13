@@ -11,6 +11,7 @@ find_package(rosidl_default_generators REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/AskNameAndDrink.action"
   "action/DescribeHuman.action"
+  "srv/CaptureImage.srv"
   "srv/VlmQuery.srv"
 )
 

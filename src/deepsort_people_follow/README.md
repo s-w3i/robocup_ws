@@ -10,6 +10,10 @@ This package provides a DeepSORT-style people tracking pipeline with depth fusio
   - `/people_tracks_3d` (`yoloe_detection_interfaces/msg/PeopleTrack3DArray`)
   - `/yoloe/tracking_detections` (`yoloe_detection_interfaces/msg/Detection3DArray`)
   - `/people/follow_target_pose` (`geometry_msgs/PoseStamped`)
+- Nav2 bridge:
+  - `/goal_update` (`geometry_msgs/PoseStamped`) when follow mode is enabled
+- Services:
+  - `/people_follow_nav2/set_enabled` (`std_srvs/srv/SetBool`) when the Nav2 bridge is launched
 - TF:
   - `person_id_<track_id>`
   - `follow_target`
@@ -56,7 +60,7 @@ colcon build --packages-select yoloe_detection_interfaces deepsort_people_follow
 
 ```bash
 cd /home/usern/robocup_ws
-./run_deepsort_people_follow_in_venv.sh
+ros2 launch deepsort_people_follow deepsort_people_follow.launch.py
 ```
 
 Default runtime now uses:
@@ -71,22 +75,33 @@ Default runtime now uses:
 - `embedder_weights_path:=/home/usern/.cache/torch/checkpoints/osnet_ain_x1_0_imagenet.pth`
 - `max_cosine_distance:=0.25`
 - `enable_ui:=true`
+- `launch_nav2_bridge:=true`
+- `nav2_bridge_enabled:=false`
 
 Example override with ROS parameters:
 
 ```bash
-./run_deepsort_people_follow_in_venv.sh --ros-args \
-  -p model_path:=/home/usern/robocup_ws/yolo11m.pt \
-  -p device:=cuda:0 \
-  -p color_topic:=/camera0/color/image_raw \
-  -p depth_topic:=/camera0/realsense_splitter_node/output/depth \
-  -p camera_info_topic:=/camera0/color/camera_info \
-  -p reid_embedder:=torchreid \
-  -p torchreid_model_name:=osnet_ain_x1_0 \
-  -p embedder_weights_path:=/home/usern/.cache/torch/checkpoints/osnet_ain_x1_0_imagenet.pth \
-  -p max_cosine_distance:=0.25 \
-  -p enable_ui:=true
+ros2 launch deepsort_people_follow deepsort_people_follow.launch.py \
+  launch_nav2_bridge:=true \
+  nav2_bridge_enabled:=false \
+  model_path:=/home/usern/robocup_ws/yolo11m.pt \
+  device:=cuda:0 \
+  color_topic:=/camera0/color/image_raw \
+  depth_topic:=/camera0/realsense_splitter_node/output/depth \
+  camera_info_topic:=/camera0/color/camera_info \
+  reid_embedder:=torchreid \
+  torchreid_model_name:=osnet_ain_x1_0 \
+  embedder_weights_path:=/home/usern/.cache/torch/checkpoints/osnet_ain_x1_0_imagenet.pth \
+  max_cosine_distance:=0.25 \
+  enable_ui:=true
 ```
+
+The same launch file now starts both:
+
+- `deepsort_people_follow_node`
+- `people_follow_nav2_bridge`
+
+The Nav2 bridge is launched by default but stays idle until follow mode is enabled through its service.
 
 ## Control tracking
 
@@ -100,6 +115,29 @@ Stop:
 
 ```bash
 ros2 service call /yoloe/set_tracking yoloe_detection_interfaces/srv/SetTracking "{enable: false, save_image: false, rate_hz: 0.0}"
+```
+
+## Nav2 people-follow bridge
+
+If you are running your normal Nav2 stack from Wheeltec bringup and only want to switch to the follow BT while people-follow mode is active, the same `deepsort_people_follow.launch.py` now launches the bridge too.
+
+This bridge:
+
+- Looks up `map -> follow_target`
+- Starts a `NavigateToPose` goal with the local BT at `bt/follower_w_recovery.xml`
+- Publishes transformed target updates on `/goal_update`
+- Cancels its follow goal when disabled so normal navigation can resume
+
+Enable follow mode:
+
+```bash
+ros2 service call /people_follow_nav2/set_enabled std_srvs/srv/SetBool "{data: true}"
+```
+
+Disable follow mode:
+
+```bash
+ros2 service call /people_follow_nav2/set_enabled std_srvs/srv/SetBool "{data: false}"
 ```
 
 ## Notes

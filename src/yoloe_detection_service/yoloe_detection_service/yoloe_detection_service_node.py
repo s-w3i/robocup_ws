@@ -8,6 +8,7 @@ service (/yoloe/detect_prompt).
 from __future__ import annotations
 
 import ctypes
+import gc
 import math
 import os
 import pathlib
@@ -170,6 +171,10 @@ class YoloeDetectionServiceNode(Node):
 
         self.declare_parameter("service_name", "/yoloe/detect_prompt")
         self.declare_parameter("model_path", "/home/usern/yoloe-26l-seg.pt")
+        self.declare_parameter("bag_model_path", "/home/usern/Kevin_yolo/yolo26l-seg_bag.pt")
+        self.declare_parameter(
+            "bag_prompt_aliases", ["bag", "paper bag", "brown paper bag", "paper bags"]
+        )
         self.declare_parameter("device", "auto")
         self.declare_parameter("imgsz", 640)
         self.declare_parameter("conf", 0.25)
@@ -202,6 +207,12 @@ class YoloeDetectionServiceNode(Node):
 
         self.service_name = str(self.get_parameter("service_name").value)
         self.model_path = str(self.get_parameter("model_path").value)
+        self.bag_model_path = str(self.get_parameter("bag_model_path").value)
+        self.bag_prompt_aliases = tuple(
+            self._normalize_class_label(str(value))
+            for value in self.get_parameter("bag_prompt_aliases").value
+            if self._normalize_class_label(str(value))
+        )
         self.device_request = str(self.get_parameter("device").value)
         self.imgsz = int(self.get_parameter("imgsz").value)
         self.conf = float(self.get_parameter("conf").value)
@@ -271,12 +282,16 @@ class YoloeDetectionServiceNode(Node):
         self._camera_states = {
             camera_name: CameraStreamState() for camera_name in self._camera_configs
         }
-        self._subscriptions: list[Any] = []
+        self._camera_subscriptions: list[Any] = []
 
         self._last_tf_map: dict[str, PublishedTFEntry] = {}
 
         self._model: Any = None
         self._prompt_key: tuple[str, ...] | None = None
+        self._supports_prompt_classes = False
+        self._loaded_model_path = ""
+        self._loaded_model_name = ""
+        self._torch: Any = None
         self._device: str = "cpu"
 
         self._tf_buffer = Buffer()
@@ -290,10 +305,12 @@ class YoloeDetectionServiceNode(Node):
         self.create_service(DetectObjectPrompt, self.service_name, self._handle_detect_request)
         self.create_timer(0.2, self._publish_last_tf)
 
-        self._load_model()
+        self._prepare_runtime()
+        self._load_model(self.model_path, "default")
 
         self.get_logger().info(f"YOLOE service ready on {self.service_name}")
-        self.get_logger().info(f"Using model: {self.model_path}")
+        self.get_logger().info(f"Default model path: {self.model_path}")
+        self.get_logger().info(f"Bag model path: {self.bag_model_path}")
         self.get_logger().info(f"Device: {self._device}")
         self.get_logger().info(f"Default camera: {self.default_camera_name}")
         for config in self._camera_configs.values():
@@ -305,7 +322,7 @@ class YoloeDetectionServiceNode(Node):
         self.get_logger().info(f"Always save image override: {self.always_save_image}")
 
     def _subscribe_camera_streams(self, camera_name: str, config: CameraStreamConfig) -> None:
-        self._subscriptions.extend(
+        self._camera_subscriptions.extend(
             [
                 self.create_subscription(
                     Image,
@@ -328,20 +345,61 @@ class YoloeDetectionServiceNode(Node):
             ]
         )
 
-    def _load_model(self) -> None:
+    def _prepare_runtime(self) -> None:
+        if self._torch is not None:
+            return
+
         ensure_torch_runtime_libs()
         preload_cupti_if_needed()
 
         import torch
-        from ultralytics import YOLOE
 
+        self._torch = torch
         self._device = self._choose_device(self.device_request, torch)
+        self.get_logger().info(f"Torch CUDA available: {torch.cuda.is_available()}")
+
+    def _load_model(self, model_path: str, model_name: str) -> None:
+        from ultralytics import YOLOE
+        from ultralytics.nn.tasks import YOLOEModel
 
         started = time.perf_counter()
-        self._model = YOLOE(self.model_path)
+        self._model = YOLOE(model_path)
+        self._prompt_key = None
+        self._supports_prompt_classes = isinstance(self._model.model, YOLOEModel)
+        self._loaded_model_path = model_path
+        self._loaded_model_name = model_name
         elapsed_s = time.perf_counter() - started
-        self.get_logger().info(f"Loaded YOLOE model in {elapsed_s:.2f}s")
-        self.get_logger().info(f"Torch CUDA available: {torch.cuda.is_available()}")
+        self.get_logger().info(f"Loaded {model_name} model in {elapsed_s:.2f}s from {model_path}")
+        if self._supports_prompt_classes:
+            self.get_logger().info(f"{model_name.capitalize()} model supports YOLOE text prompts.")
+        else:
+            fixed_classes = ", ".join(str(name) for name in self._model.names.values())
+            self.get_logger().warn(
+                f"{model_name.capitalize()} model is fixed-class. "
+                f"Prompt text will be matched against: {fixed_classes}"
+            )
+
+    def _unload_model(self) -> None:
+        if self._model is None:
+            return
+
+        self.get_logger().info(
+            f"Unloading {self._loaded_model_name or 'active'} model from {self._loaded_model_path}"
+        )
+        self._model = None
+        self._prompt_key = None
+        self._supports_prompt_classes = False
+        self._loaded_model_path = ""
+        self._loaded_model_name = ""
+        gc.collect()
+        if self._torch is not None and self._device == "cuda" and self._torch.cuda.is_available():
+            self._torch.cuda.empty_cache()
+
+    def _ensure_model_loaded(self, model_path: str, model_name: str) -> None:
+        if self._model is not None and self._loaded_model_path == model_path:
+            return
+        self._unload_model()
+        self._load_model(model_path, model_name)
 
     @staticmethod
     def _choose_device(requested: str, torch_module: Any) -> str:
@@ -403,7 +461,23 @@ class YoloeDetectionServiceNode(Node):
             return response
 
         config = self._camera_configs[camera_name]
-        run_result = self._run_detection(camera_name, prompts, request.save_image)
+        use_bag_model = self._is_bag_only_request(prompts)
+        try:
+            run_result = self._run_detection(
+                camera_name,
+                prompts,
+                request.save_image,
+                use_bag_model=use_bag_model,
+            )
+        except Exception as exc:
+            self.get_logger().error(f"Detection request failed: {exc}")
+            response.message = f"Detection request failed: {exc}"
+            return response
+        finally:
+            if use_bag_model:
+                with self._inference_lock:
+                    if self._loaded_model_path == self.bag_model_path:
+                        self._unload_model()
         response.detections_in_frame = run_result.detections_in_frame
         response.tf_published_count = run_result.tf_published_count
         response.inference_ms = run_result.inference_ms
@@ -431,7 +505,12 @@ class YoloeDetectionServiceNode(Node):
         return response
 
     def _run_detection(
-        self, camera_name: str, prompts: list[str], save_image_request: bool
+        self,
+        camera_name: str,
+        prompts: list[str],
+        save_image_request: bool,
+        *,
+        use_bag_model: bool,
     ) -> DetectionRunResult:
         config = self._camera_configs[camera_name]
         with self._lock:
@@ -473,14 +552,25 @@ class YoloeDetectionServiceNode(Node):
             )
 
         with self._inference_lock:
+            selected_model_path = self.bag_model_path if use_bag_model else self.model_path
+            selected_model_name = "bag" if use_bag_model else "default"
+            self._ensure_model_loaded(selected_model_path, selected_model_name)
+
             prompt_key = tuple(prompts)
             if prompt_key != self._prompt_key:
                 started = time.perf_counter()
-                self._model.set_classes(prompts)
+                if self._supports_prompt_classes:
+                    self._model.set_classes(prompts)
+                else:
+                    available_classes = ", ".join(str(name) for name in self._model.names.values())
+                    self.get_logger().info(
+                        "Fixed-class model active; prompt filter '%s' will be matched against: %s"
+                        % (", ".join(prompts), available_classes)
+                    )
                 set_classes_ms = (time.perf_counter() - started) * 1000.0
                 self._prompt_key = prompt_key
                 self.get_logger().info(
-                    f"Updated prompt classes ({', '.join(prompts)}) in {set_classes_ms:.1f} ms"
+                    f"Prepared prompt classes ({', '.join(prompts)}) in {set_classes_ms:.1f} ms"
                 )
 
             if self.force_torch_nms:
@@ -503,6 +593,21 @@ class YoloeDetectionServiceNode(Node):
             return DetectionRunResult([], 0, 0, inference_ms, "", 0, "YOLOE returned no results.")
 
         result = results[0]
+        if not self._supports_prompt_classes:
+            matched_model_classes = self._matching_model_classes(prompts)
+            if not matched_model_classes:
+                available_classes = ", ".join(str(name) for name in self._model.names.values())
+                return DetectionRunResult(
+                    [],
+                    0,
+                    0,
+                    inference_ms,
+                    "",
+                    0,
+                    "Prompt did not match any classes in the loaded fixed-class model. "
+                    f"Requested: {', '.join(prompts)}. Available classes: {available_classes}.",
+                )
+
         boxes = result.boxes
         if boxes is None or len(boxes) == 0:
             return DetectionRunResult(
@@ -514,6 +619,21 @@ class YoloeDetectionServiceNode(Node):
                 0,
                 "No objects detected for the requested prompt.",
             )
+
+        if not self._supports_prompt_classes:
+            matched_indices = self._matching_detection_indices(result, prompts)
+            if not matched_indices:
+                return DetectionRunResult(
+                    [],
+                    0,
+                    0,
+                    inference_ms,
+                    "",
+                    0,
+                    "No objects detected for the requested prompt.",
+                )
+            self._filter_result_to_indices(result, matched_indices)
+            boxes = result.boxes
 
         detections_in_frame = int(len(boxes))
 
@@ -606,13 +726,14 @@ class YoloeDetectionServiceNode(Node):
                 translation=point_in_camera.copy(),
             )
             entries.append(DetectionEntry(class_name, confidence, pose_msg, child_frame))
+            break
 
         self._set_last_tfs(frame_map)
 
         saved_path = ""
         if self.always_save_image or save_image_request:
             annotated = result.plot()
-            label = "multi" if entries else "no_valid_depth"
+            label = "best" if entries else "no_valid_depth"
             saved_path = self._save_annotated_image(annotated, prompts, label)
 
         if not entries:
@@ -833,6 +954,58 @@ class YoloeDetectionServiceNode(Node):
         if isinstance(names, list) and 0 <= class_id < len(names):
             return str(names[class_id])
         return str(class_id)
+
+    @staticmethod
+    def _normalize_class_label(text: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", text.casefold()).strip()
+
+    def _is_bag_prompt(self, prompt: str) -> bool:
+        return self._normalize_class_label(prompt) in self.bag_prompt_aliases
+
+    def _is_bag_only_request(self, prompts: list[str]) -> bool:
+        return bool(prompts) and all(self._is_bag_prompt(prompt) for prompt in prompts)
+
+    def _prompt_matches_class(self, prompt: str, class_name: str) -> bool:
+        normalized_prompt = self._normalize_class_label(prompt)
+        normalized_class = self._normalize_class_label(class_name)
+        if not normalized_prompt or not normalized_class:
+            return False
+        return (
+            normalized_prompt == normalized_class
+            or normalized_prompt in normalized_class
+            or normalized_class in normalized_prompt
+        )
+
+    def _matching_detection_indices(self, result: Any, prompts: list[str]) -> list[int]:
+        boxes = result.boxes
+        if boxes is None or len(boxes) == 0:
+            return []
+
+        matched_indices: list[int] = []
+        for idx, box in enumerate(boxes):
+            class_name = self._class_name(result.names, int(box.cls.item()))
+            if any(self._prompt_matches_class(prompt, class_name) for prompt in prompts):
+                matched_indices.append(idx)
+        return matched_indices
+
+    def _matching_model_classes(self, prompts: list[str]) -> list[str]:
+        matched_classes: list[str] = []
+        for class_name in self._model.names.values():
+            class_name = str(class_name)
+            if any(self._prompt_matches_class(prompt, class_name) for prompt in prompts):
+                matched_classes.append(class_name)
+        return matched_classes
+
+    @staticmethod
+    def _filter_result_to_indices(result: Any, matched_indices: list[int]) -> None:
+        result.update(
+            boxes=result.boxes.data[matched_indices],
+            masks=(
+                result.masks.data[matched_indices]
+                if result.masks is not None and result.masks.data is not None
+                else None
+            ),
+        )
 
     def _save_annotated_image(
         self, image: np.ndarray, prompts: list[str], detected_class: str
