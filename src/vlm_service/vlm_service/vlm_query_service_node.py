@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ROS 2 service node for text or image-assisted VLM queries via Ollama."""
+"""ROS 2 service node for text or image-assisted VLM queries via Ollama or OpenAI."""
 
 from __future__ import annotations
 
@@ -36,6 +36,11 @@ DUAL_RESPONSE_SCHEMA: dict[str, Any] = {
     "required": ["speech_text", "data_text"],
 }
 
+DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+DEFAULT_OPENAI_API_URL = "https://api.openai.com/v1/responses"
+DEFAULT_OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
+DEFAULT_OPENAI_MODEL = "gpt-5.5"
+
 
 @dataclass
 class CameraFrame:
@@ -60,7 +65,13 @@ class VlmQueryServiceNode(Node):
         super().__init__("vlm_query_service_node")
 
         self.declare_parameter("service_name", "/vlm/query")
-        self.declare_parameter("ollama_base_url", os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434"))
+        self.declare_parameter("ollama_base_url", os.environ.get("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL))
+        self.declare_parameter("use_openai_vlm", False)
+        self.declare_parameter("openai_api_url", os.environ.get("OPENAI_API_URL", DEFAULT_OPENAI_API_URL))
+        self.declare_parameter("openai_api_key_env", os.environ.get("OPENAI_API_KEY_ENV", DEFAULT_OPENAI_API_KEY_ENV))
+        self.declare_parameter("openai_model", os.environ.get("OPENAI_MODEL", DEFAULT_OPENAI_MODEL))
+        self.declare_parameter("openai_image_detail", "auto")
+        self.declare_parameter("openai_thinking_effort", "medium")
         self.declare_parameter("vlm_model", os.environ.get("VISION_MODEL", "qwen3.5:9b"))
         self.declare_parameter("vlm_keep_alive", os.environ.get("OLLAMA_KEEP_ALIVE", "30m"))
         self.declare_parameter("vlm_timeout_sec", 90.0)
@@ -81,6 +92,9 @@ class VlmQueryServiceNode(Node):
         self.declare_parameter("camera_names_csv", "")
         self.declare_parameter("camera_topics_csv", "")
         self.declare_parameter("image_wait_timeout_sec", 3.0)
+        self.declare_parameter("lazy_subscriptions", True)
+        self.declare_parameter("subscription_idle_timeout_sec", 3.0)
+        self.declare_parameter("subscription_poll_period_sec", 0.5)
         self.declare_parameter("manage_robot_status", True)
         self.declare_parameter("robot_status_service", "/robot_status")
         self.declare_parameter("robot_status_timeout_sec", 2.0)
@@ -97,6 +111,14 @@ class VlmQueryServiceNode(Node):
 
         self.service_name = str(self.get_parameter("service_name").value)
         self.ollama_base_url = str(self.get_parameter("ollama_base_url").value).rstrip("/")
+        self.use_openai_vlm = bool(self.get_parameter("use_openai_vlm").value)
+        self.openai_api_url = str(self.get_parameter("openai_api_url").value).strip() or DEFAULT_OPENAI_API_URL
+        self.openai_api_key_env = (
+            str(self.get_parameter("openai_api_key_env").value).strip() or DEFAULT_OPENAI_API_KEY_ENV
+        )
+        self.openai_model = str(self.get_parameter("openai_model").value).strip() or DEFAULT_OPENAI_MODEL
+        self.openai_image_detail = str(self.get_parameter("openai_image_detail").value).strip() or "auto"
+        self.openai_thinking_effort = str(self.get_parameter("openai_thinking_effort").value).strip() or "medium"
         self.vlm_model = str(self.get_parameter("vlm_model").value)
         self.vlm_keep_alive = str(self.get_parameter("vlm_keep_alive").value)
         self.vlm_timeout_sec = max(5.0, float(self.get_parameter("vlm_timeout_sec").value))
@@ -123,6 +145,13 @@ class VlmQueryServiceNode(Node):
         camera_names_csv = str(self.get_parameter("camera_names_csv").value).strip()
         camera_topics_csv = str(self.get_parameter("camera_topics_csv").value).strip()
         self.image_wait_timeout_sec = max(0.1, float(self.get_parameter("image_wait_timeout_sec").value))
+        self.lazy_subscriptions = bool(self.get_parameter("lazy_subscriptions").value)
+        self.subscription_idle_timeout_sec = max(
+            0.0, float(self.get_parameter("subscription_idle_timeout_sec").value)
+        )
+        self.subscription_poll_period_sec = max(
+            0.1, float(self.get_parameter("subscription_poll_period_sec").value)
+        )
         self.manage_robot_status = bool(self.get_parameter("manage_robot_status").value)
         self.robot_status_service = str(self.get_parameter("robot_status_service").value).strip() or "/robot_status"
         self.robot_status_timeout_sec = max(0.1, float(self.get_parameter("robot_status_timeout_sec").value))
@@ -146,24 +175,20 @@ class VlmQueryServiceNode(Node):
         self._lock = threading.Lock()
         self._callback_group = ReentrantCallbackGroup()
         self._frames: dict[str, CameraFrame] = {}
-        self._camera_subscriptions = []
         self._camera_topics_by_name = dict(zip(self.camera_names, self.camera_topics))
+        self._camera_subscriptions: dict[str, Any] = {}
+        self._camera_subscription_deadlines: dict[str, float] = {}
         self._robot_status_client = self.create_client(
             RobotStatus,
             self.robot_status_service,
             callback_group=self._callback_group,
         )
 
-        for camera_name, topic in self._camera_topics_by_name.items():
-            subscription = self.create_subscription(
-                Image,
-                topic,
-                lambda msg, name=camera_name: self._on_image(name, msg),
-                qos_profile_sensor_data,
-                callback_group=self._callback_group,
-            )
-            self._camera_subscriptions.append(subscription)
-            self.get_logger().info(f"Subscribed to camera '{camera_name}' on {topic}")
+        self.create_timer(self.subscription_poll_period_sec, self._cleanup_idle_subscriptions)
+
+        if not self.lazy_subscriptions:
+            for camera_name in self._camera_topics_by_name:
+                self._subscribe_camera(camera_name)
 
         self.create_service(
             VlmQuery,
@@ -172,11 +197,18 @@ class VlmQueryServiceNode(Node):
             callback_group=self._callback_group,
         )
 
-        if self.auto_start_ollama:
+        if self.auto_start_ollama and not self.use_openai_vlm:
             self._ensure_ollama_running()
 
         self.get_logger().info(
-            f"VLM query service ready on {self.service_name} using model '{self.vlm_model}'"
+            "VLM query service ready on "
+            f"{self.service_name} using backend "
+            f"'{'openai' if self.use_openai_vlm else 'ollama'}' "
+            f"model '{self.openai_model if self.use_openai_vlm else self.vlm_model}'"
+        )
+        self.get_logger().info(
+            "Lazy subscriptions: %s (idle_timeout=%.2fs)"
+            % (str(self.lazy_subscriptions).lower(), self.subscription_idle_timeout_sec)
         )
 
     def _trace(self, message: str) -> None:
@@ -197,6 +229,78 @@ class VlmQueryServiceNode(Node):
                 stamp_ns=stamp_ns,
                 received_monotonic=time.monotonic(),
             )
+
+    def _subscribe_camera(self, camera_name: str) -> None:
+        if camera_name not in self._camera_topics_by_name:
+            raise ValueError(
+                f"Unknown camera '{camera_name}'. Available cameras: {sorted(self._camera_topics_by_name)}"
+            )
+
+        topic = self._camera_topics_by_name[camera_name]
+        with self._lock:
+            if camera_name in self._camera_subscriptions:
+                if self.lazy_subscriptions:
+                    self._camera_subscription_deadlines[camera_name] = (
+                        time.monotonic() + self.subscription_idle_timeout_sec
+                    )
+                return
+
+        subscription = self.create_subscription(
+            Image,
+            topic,
+            lambda msg, name=camera_name: self._on_image(name, msg),
+            qos_profile_sensor_data,
+            callback_group=self._callback_group,
+        )
+
+        with self._lock:
+            self._camera_subscriptions[camera_name] = subscription
+            if self.lazy_subscriptions:
+                self._camera_subscription_deadlines[camera_name] = (
+                    time.monotonic() + self.subscription_idle_timeout_sec
+                )
+
+        self.get_logger().info(f"[{camera_name}] Subscribed to camera stream on demand.")
+
+    def _unsubscribe_camera(self, camera_name: str) -> None:
+        with self._lock:
+            subscription = self._camera_subscriptions.pop(camera_name, None)
+            self._camera_subscription_deadlines.pop(camera_name, None)
+            self._frames.pop(camera_name, None)
+
+        if subscription is None:
+            return
+
+        try:
+            self.destroy_subscription(subscription)
+        except Exception:
+            pass
+
+        self.get_logger().info(f"[{camera_name}] Unsubscribed from idle camera stream.")
+
+    def _touch_camera_subscription(self, camera_name: str) -> None:
+        if not self.lazy_subscriptions:
+            return
+        with self._lock:
+            if camera_name in self._camera_subscriptions:
+                self._camera_subscription_deadlines[camera_name] = (
+                    time.monotonic() + self.subscription_idle_timeout_sec
+                )
+
+    def _cleanup_idle_subscriptions(self) -> None:
+        if not self.lazy_subscriptions or self.subscription_idle_timeout_sec <= 0.0:
+            return
+
+        now = time.monotonic()
+        with self._lock:
+            expired_camera_names = [
+                camera_name
+                for camera_name, deadline in self._camera_subscription_deadlines.items()
+                if deadline <= now
+            ]
+
+        for camera_name in expired_camera_names:
+            self._unsubscribe_camera(camera_name)
 
     def _handle_query(
         self, request: VlmQuery.Request, response: VlmQuery.Response
@@ -228,7 +332,7 @@ class VlmQueryServiceNode(Node):
             if self.manage_robot_status:
                 thinking_state_set = self._set_robot_status("thinking")
 
-            if self.auto_start_ollama and not self._ollama_ready(timeout=1.0):
+            if self.auto_start_ollama and not self.use_openai_vlm and not self._ollama_ready(timeout=1.0):
                 self._ensure_ollama_running()
 
             image_b64 = None
@@ -268,12 +372,20 @@ class VlmQueryServiceNode(Node):
                 num_predict_override=int(request.num_predict_override),
                 timeout_sec_override=float(request.timeout_sec_override),
             )
-            speech_text, data_text, model_name = self._query_ollama(
-                prompt_text,
-                image_b64=image_b64,
-                reasoning_mode=reasoning_mode,
-                query_policy=query_policy,
-            )
+            if self.use_openai_vlm:
+                speech_text, data_text, model_name = self._query_openai(
+                    prompt_text,
+                    image_b64=image_b64,
+                    reasoning_mode=reasoning_mode,
+                    query_policy=query_policy,
+                )
+            else:
+                speech_text, data_text, model_name = self._query_ollama(
+                    prompt_text,
+                    image_b64=image_b64,
+                    reasoning_mode=reasoning_mode,
+                    query_policy=query_policy,
+                )
 
             response.success = True
             response.message = "ok"
@@ -305,8 +417,10 @@ class VlmQueryServiceNode(Node):
                 f"Unknown camera '{camera_name}'. Available cameras: {sorted(self._camera_topics_by_name)}"
             )
 
+        self._subscribe_camera(camera_name)
         deadline = time.time() + self.image_wait_timeout_sec
         while time.time() < deadline:
+            self._touch_camera_subscription(camera_name)
             with self._lock:
                 frame = self._frames.get(camera_name)
             if frame is not None:
@@ -446,6 +560,175 @@ class VlmQueryServiceNode(Node):
             return final_speech_text, final_data_text, model_name
         raise RuntimeError("VLM returned an empty response")
 
+    def _query_openai(
+        self, prompt_text: str, image_b64: str | None, reasoning_mode: str, query_policy: QueryPolicy
+    ) -> tuple[str, str, str]:
+        use_vision = image_b64 is not None
+        model_name = self.openai_model
+        attempt_specs = [(query_policy.num_predict, query_policy.timeout_sec)]
+        for _ in range(max(0, query_policy.max_retry_count)):
+            attempt_specs.append((query_policy.retry_num_predict, query_policy.retry_timeout_sec))
+
+        last_error: Exception | None = None
+        final_speech_text = ""
+        final_data_text = ""
+        for attempt_index, (attempt_predict, attempt_timeout) in enumerate(attempt_specs, start=1):
+            content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt_text}]
+            if image_b64 is not None:
+                content.append(
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/jpeg;base64,{image_b64}",
+                        "detail": self.openai_image_detail,
+                    }
+                )
+            payload: dict[str, Any] = {
+                "model": model_name,
+                "instructions": "Return only JSON that matches the requested schema.",
+                "input": [{"role": "user", "content": content}],
+                "text": {"format": {"type": "json_object"}},
+                "max_output_tokens": attempt_predict,
+                "store": False,
+            }
+            if reasoning_mode == "thinking":
+                payload["reasoning"] = {"effort": self.openai_thinking_effort}
+
+            attempt_started = time.time()
+            self._trace(
+                "openai request start | "
+                f"attempt={attempt_index}/{len(attempt_specs)} "
+                f"use_vision={use_vision} "
+                f"model={model_name!r} "
+                f"timeout_s={attempt_timeout:.1f} "
+                f"max_output_tokens={attempt_predict} "
+                f"reasoning_mode={reasoning_mode}"
+            )
+            try:
+                result = requests.post(
+                    self.openai_api_url,
+                    headers={
+                        "Authorization": f"Bearer {self._openai_api_key()}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=max(1.0, attempt_timeout),
+                )
+                if not result.ok:
+                    raise RuntimeError(f"OpenAI request failed: HTTP {result.status_code} {result.text[:500]}")
+                self._trace(
+                    "openai request finished | "
+                    f"attempt={attempt_index} "
+                    f"status_code={result.status_code} "
+                    f"elapsed_s={time.time() - attempt_started:.3f}"
+                )
+                output_text = self._extract_openai_output_text(result.json())
+                if self.trace_log_raw_reply:
+                    self._trace(f"openai raw reply | content={output_text[:1200]!r}")
+                speech_text, data_text = self._decode_dual_response(
+                    content=output_text,
+                    thinking="",
+                    allow_json_repair=query_policy.allow_json_repair,
+                )
+                validation_error = self._validate_dual_response(
+                    speech_text,
+                    data_text,
+                    allow_json_repair=query_policy.allow_json_repair,
+                    request_profile=query_policy.request_profile,
+                )
+                if validation_error is None:
+                    final_speech_text = speech_text
+                    final_data_text = data_text
+                    break
+                last_error = RuntimeError(validation_error)
+                if attempt_index < len(attempt_specs):
+                    self.get_logger().warn(
+                        "Structured OpenAI reply was incomplete or malformed; retrying with a larger generation budget."
+                    )
+                    continue
+                raise last_error
+            except requests.ReadTimeout as exc:
+                last_error = exc
+                if attempt_index < len(attempt_specs):
+                    self.get_logger().warn(
+                        "Query timed out waiting for OpenAI; retrying once with a longer timeout."
+                    )
+                    continue
+                raise RuntimeError("Timed out waiting for OpenAI response.") from exc
+            except requests.RequestException as exc:
+                last_error = exc
+                raise
+
+        if last_error is not None and not final_speech_text and not final_data_text:
+            raise RuntimeError(str(last_error) if last_error is not None else "OpenAI request failed")
+        if final_speech_text or final_data_text:
+            return final_speech_text, final_data_text, model_name
+        raise RuntimeError("VLM returned an empty response")
+
+    def _openai_api_key(self) -> str:
+        api_key = os.environ.get(self.openai_api_key_env, "").strip()
+        if not api_key:
+            raise RuntimeError(
+                f"OpenAI API key is not set. Export {self.openai_api_key_env} before starting this node."
+            )
+        return api_key
+
+    @staticmethod
+    def _extract_openai_output_text(payload: dict[str, Any]) -> str:
+        direct_text = str(payload.get("output_text") or "").strip()
+        if direct_text:
+            return direct_text
+
+        parts: list[str] = []
+        for item in payload.get("output", []):
+            if not isinstance(item, dict):
+                continue
+            item_text = str(item.get("text") or item.get("output_text") or "").strip()
+            if item_text:
+                parts.append(item_text)
+            for content in item.get("content", []):
+                if not isinstance(content, dict):
+                    continue
+                if content.get("type") in {"output_text", "text"}:
+                    text = str(content.get("text") or content.get("output_text") or "")
+                    if text:
+                        parts.append(text)
+                elif content.get("type") == "refusal":
+                    text = str(content.get("refusal") or "").strip()
+                    if text:
+                        parts.append(text)
+                elif "json" in content and isinstance(content.get("json"), (dict, list)):
+                    parts.append(json.dumps(content["json"], ensure_ascii=False))
+                elif "value" in content and isinstance(content.get("value"), (dict, list)):
+                    parts.append(json.dumps(content["value"], ensure_ascii=False))
+        if parts:
+            return "\n".join(parts).strip()
+        if isinstance(payload.get("output"), dict):
+            return json.dumps(payload["output"], ensure_ascii=False)
+        if isinstance(payload, dict):
+            for key in ("response", "result", "message"):
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    return json.dumps(value, ensure_ascii=False)
+        return "\n".join(parts).strip()
+
+    @staticmethod
+    def _normalize_structured_result(parsed: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(parsed)
+        entities = normalized.get("entities")
+        if isinstance(entities, dict):
+            return normalized
+
+        reserved = {"task", "reason", "complete", "speech_text", "data_text"}
+        candidate_entities: dict[str, Any] = {}
+        for key, value in list(normalized.items()):
+            if key in reserved:
+                continue
+            candidate_entities[key] = value
+
+        if candidate_entities:
+            normalized["entities"] = candidate_entities
+        return normalized
+
     @staticmethod
     def _parse_json_relaxed(text: str, allow_repair: bool = True) -> dict[str, Any]:
         cleaned = text.strip()
@@ -518,13 +801,22 @@ class VlmQueryServiceNode(Node):
         data_value = parsed.get("data_text", "")
         if isinstance(data_value, str):
             data_text = data_value.strip()
+            try:
+                nested_data = self._parse_json_relaxed(data_text, allow_repair=allow_json_repair)
+            except Exception:
+                nested_data = None
+            if isinstance(nested_data, dict):
+                data_text = json.dumps(self._normalize_structured_result(nested_data), ensure_ascii=False)
         else:
-            data_text = json.dumps(data_value, ensure_ascii=False)
+            normalized_data_value = (
+                self._normalize_structured_result(data_value) if isinstance(data_value, dict) else data_value
+            )
+            data_text = json.dumps(normalized_data_value, ensure_ascii=False)
 
         # Backward-compatible schema: model returned only the structured result.
         has_structured_fields = any(key in parsed for key in ("task", "reason", "entities"))
         if not speech_text and not data_text and has_structured_fields:
-            data_text = json.dumps(parsed, ensure_ascii=False)
+            data_text = json.dumps(self._normalize_structured_result(parsed), ensure_ascii=False)
 
         # If the model returned both speech_text and structured fields at the top level,
         # preserve the structured fields in data_text.
@@ -535,7 +827,7 @@ class VlmQueryServiceNode(Node):
                 if key not in {"speech_text", "data_text"}
             }
             if structured:
-                data_text = json.dumps(structured, ensure_ascii=False)
+                data_text = json.dumps(self._normalize_structured_result(structured), ensure_ascii=False)
 
         # Another common failure mode: the model places the structured JSON string
         # inside speech_text and leaves data_text empty.
@@ -547,7 +839,7 @@ class VlmQueryServiceNode(Node):
             if isinstance(nested, dict) and any(
                 key in nested for key in ("task", "reason", "entities")
             ):
-                data_text = json.dumps(nested, ensure_ascii=False)
+                data_text = json.dumps(self._normalize_structured_result(nested), ensure_ascii=False)
                 speech_text = ""
 
         return speech_text, data_text
@@ -564,7 +856,9 @@ class VlmQueryServiceNode(Node):
         if not data_text:
             return "data_text is empty"
         try:
-            parsed = self._parse_json_relaxed(data_text, allow_repair=allow_json_repair)
+            parsed = self._normalize_structured_result(
+                self._parse_json_relaxed(data_text, allow_repair=allow_json_repair)
+            )
         except Exception as exc:
             return f"data_text is not valid JSON: {exc}"
         if not isinstance(parsed, dict):
@@ -611,7 +905,8 @@ class VlmQueryServiceNode(Node):
             "dialogue_text": (1, True),
             "strict_text": (1, True),
             "vision_strict": (1, True),
-            "vision_gate": (0, True),
+            # Keep one internal retry for transient upstream failures (e.g. HTTP 5xx).
+            "vision_gate": (1, True),
         }
         default_retry_count, default_allow_repair = profile_defaults.get(
             profile,

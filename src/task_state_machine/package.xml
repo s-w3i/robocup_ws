@@ -3,10 +3,12 @@
 <package format="3">
   <name>task_state_machine</name>
   <version>0.0.1</version>
-  <description>YASMIN-based ROS 2 receptionist task state machine.</description>
+  <description>YASMIN-based ROS 2 task state machines.</description>
   <maintainer email="usern@example.com">usern</maintainer>
   <license>Apache-2.0</license>
 
+  <depend>action_msgs</depend>
+  <depend>nav2_msgs</depend>
   <depend>rclpy</depend>
   <depend>coqui_tts_interfaces</depend>
   <depend>coqui_tts_service</depend>
@@ -15,7 +17,13 @@
   <depend>yoloe_detection_interfaces</depend>
   <depend>yoloe_detection_service</depend>
   <depend>geometry_msgs</depend>
+  <depend>robot_arm_action</depend>
+  <depend>std_srvs</depend>
+  <depend>std_msgs</depend>
+  <depend>tf2_ros</depend>
+  <exec_depend>deepsort_people_follow</exec_depend>
   <exec_depend>bt_tree_view</exec_depend>
+  <exec_depend>python3-requests</exec_depend>
 
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>

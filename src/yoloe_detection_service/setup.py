@@ -27,6 +27,7 @@ setup(
             'yoloe_pointed_detection_service_node = yoloe_detection_service.yoloe_pointed_detection_service_node:main',
             'yoloe_pointed_detection_client = yoloe_detection_service.yoloe_pointed_detection_client:main',
             'yoloe_vlm_pointed_detection_service_node = yoloe_detection_service.yoloe_vlm_pointed_detection_service_node:main',
+            'yoloe_seg4_detection_service_node = yoloe_detection_service.yoloe_seg4_detection_service_node:main',
         ],
     },
 )

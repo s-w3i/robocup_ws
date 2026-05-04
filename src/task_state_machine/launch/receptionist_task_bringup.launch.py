@@ -2,7 +2,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
@@ -13,14 +13,16 @@ def generate_launch_description() -> LaunchDescription:
     camera_info_topic = LaunchConfiguration("camera_info_topic")
     camera_link_frame = LaunchConfiguration("camera_link_frame")
     default_camera_name = LaunchConfiguration("default_camera_name")
-    vlm_model = LaunchConfiguration("vlm_model")
-    ollama_base_url = LaunchConfiguration("ollama_base_url")
+    openai_api_url = LaunchConfiguration("openai_api_url")
+    openai_api_key_env = LaunchConfiguration("openai_api_key_env")
     yolo_model_path = LaunchConfiguration("yolo_model_path")
     yolo_python_site_packages = LaunchConfiguration("yolo_python_site_packages")
     face_fullscreen = LaunchConfiguration("face_fullscreen")
+    sim = LaunchConfiguration("sim")
     launch_whisper = LaunchConfiguration("launch_whisper")
     debug_text_input_mode = LaunchConfiguration("debug_text_input_mode")
     debug_text_input_prompt = LaunchConfiguration("debug_text_input_prompt")
+    enable_speaking = LaunchConfiguration("enable_speaking")
     launch_state_machine = LaunchConfiguration("launch_state_machine")
     launch_bt_monitor = LaunchConfiguration("launch_bt_monitor")
     bt_use_ui = LaunchConfiguration("bt_use_ui")
@@ -37,6 +39,7 @@ def generate_launch_description() -> LaunchDescription:
         executable="coqui_talking_face_action_node",
         name="coqui_talking_face_action_node",
         output="screen",
+        condition=IfCondition(enable_speaking),
         parameters=[
             {
                 "face_fullscreen": face_fullscreen,
@@ -50,25 +53,6 @@ def generate_launch_description() -> LaunchDescription:
         name="whisper_command_node",
         output="screen",
         condition=IfCondition(launch_whisper),
-    )
-
-    vlm_query_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            PathJoinSubstitution(
-                [FindPackageShare("vlm_service"), "launch", "vlm_query_service.launch.py"]
-            )
-        ),
-        launch_arguments={
-            "service_name": "/vlm/query",
-            "ollama_base_url": ollama_base_url,
-            "vlm_model": vlm_model,
-            "default_camera_name": default_camera_name,
-            "default_camera_topic": color_topic,
-            "camera_names_csv": default_camera_name,
-            "camera_topics_csv": color_topic,
-            "manage_robot_status": "true",
-            "robot_status_service": "/robot_status",
-        }.items(),
     )
 
     yolo_detection_launch = IncludeLaunchDescription(
@@ -98,9 +82,11 @@ def generate_launch_description() -> LaunchDescription:
         parameters=[
             {
                 "action_name": "/ask_name_and_drink",
-                "vlm_query_service": "/vlm/query",
+                "openai_api_url": openai_api_url,
+                "openai_api_key_env": openai_api_key_env,
                 "get_command_service": "/get_command",
                 "speak_action_name": "/coqui_tts/speak",
+                "enable_speaking": enable_speaking,
                 "debug_text_input_mode": debug_text_input_mode,
                 "debug_text_input_prompt": debug_text_input_prompt,
             }
@@ -116,9 +102,12 @@ def generate_launch_description() -> LaunchDescription:
         parameters=[
             {
                 "action_name": "/describe_human",
-                "vlm_query_service": "/vlm/query",
+                "openai_api_url": openai_api_url,
+                "openai_api_key_env": openai_api_key_env,
                 "speak_action_name": "/coqui_tts/speak",
+                "enable_speaking": enable_speaking,
                 "default_camera_name": default_camera_name,
+                "default_camera_topic": color_topic,
             }
         ],
     )
@@ -131,6 +120,9 @@ def generate_launch_description() -> LaunchDescription:
         condition=IfCondition(launch_state_machine),
         additional_env={
             "YOLO_DETECTION_CAMERA_NAME": default_camera_name,
+            "RECEPTIONIST_SIM": sim,
+            "OPENAI_API_URL": openai_api_url,
+            "OPENAI_API_KEY_ENV": openai_api_key_env,
         },
     )
 
@@ -156,24 +148,28 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument("camera_info_topic", default_value="/camera0/color/camera_info"),
             DeclareLaunchArgument("camera_link_frame", default_value="camera0_link"),
-            DeclareLaunchArgument("vlm_model", default_value="qwen3.5:9b"),
-            DeclareLaunchArgument("ollama_base_url", default_value="http://127.0.0.1:11434"),
+            DeclareLaunchArgument("openai_api_url", default_value="https://api.openai.com/v1/responses"),
+            DeclareLaunchArgument("openai_api_key_env", default_value="OPENAI_API_KEY"),
             DeclareLaunchArgument("yolo_model_path", default_value="/home/usern/yoloe-26l-seg.pt"),
             DeclareLaunchArgument(
                 "yolo_python_site_packages",
                 default_value="/home/usern/coqui-venv/lib/python3.10/site-packages",
             ),
             DeclareLaunchArgument("face_fullscreen", default_value="false"),
+            DeclareLaunchArgument(
+                "sim",
+                default_value=EnvironmentVariable("RECEPTIONIST_SIM", default_value="false"),
+            ),
             DeclareLaunchArgument("launch_whisper", default_value="true"),
             DeclareLaunchArgument("debug_text_input_mode", default_value="false"),
             DeclareLaunchArgument("debug_text_input_prompt", default_value="guest"),
+            DeclareLaunchArgument("enable_speaking", default_value="true"),
             DeclareLaunchArgument("launch_state_machine", default_value="false"),
             DeclareLaunchArgument("launch_bt_monitor", default_value="false"),
             DeclareLaunchArgument("bt_use_ui", default_value="false"),
             robot_status_node,
             coqui_talking_face_action_node,
             whisper_command_node,
-            vlm_query_launch,
             yolo_detection_launch,
             ask_name_and_drink_node,
             describe_human_node,

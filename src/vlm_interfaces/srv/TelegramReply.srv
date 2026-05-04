@@ -1,0 +1,7 @@
+string chat_id
+string text
+string image_path
+int32 reply_to_message_id
+---
+bool success
+string message

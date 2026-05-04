@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--camera-name",
         default="",
-        help="Requested camera name (for example 'camera0' or 'camera'). Empty uses the server default.",
+        help="Requested camera name (for example 'camera0' or 'gripper_camera'). Empty uses the server default.",
     )
     return parser.parse_args()
 

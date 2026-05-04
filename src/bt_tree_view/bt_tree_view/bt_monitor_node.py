@@ -98,6 +98,8 @@ class BtMonitorNode(Node):
                             f"attempt={summary.get('attempt_count', 0)} "
                             f"name={summary.get('name', '')!r} "
                             f"drink={summary.get('drink', '')!r} "
+                            f"food_flavour_preference={summary.get('food_flavour_preference', '')!r} "
+                            f"food_allergy={summary.get('food_allergy', '')!r} "
                             f"error={summary.get('last_error', '')!r}"
                         ),
                         f"Robot: {str(summary.get('robot_text', '') or '')}",

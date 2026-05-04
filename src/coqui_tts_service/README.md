@@ -115,7 +115,7 @@ Override wake word / service timeout:
 
 ```bash
 ros2 run coqui_tts_service whisper_command_node --ros-args \
-  -p awake_word:="hi eva" \
+  -p awake_words:="['hi']" \
   -p get_command_timeout_sec:=12.0 \
   -p calibration_seconds:=10.0 \
   -p whisper_device:=auto \

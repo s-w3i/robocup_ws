@@ -8,6 +8,10 @@ def generate_launch_description() -> LaunchDescription:
     args = [
         DeclareLaunchArgument("service_name", default_value="/vlm/query"),
         DeclareLaunchArgument("ollama_base_url", default_value="http://127.0.0.1:11434"),
+        DeclareLaunchArgument("use_openai_vlm", default_value="false"),
+        DeclareLaunchArgument("openai_api_url", default_value="https://api.openai.com/v1/responses"),
+        DeclareLaunchArgument("openai_api_key_env", default_value="OPENAI_API_KEY"),
+        DeclareLaunchArgument("openai_model", default_value="gpt-5.5"),
         DeclareLaunchArgument("vlm_model", default_value="qwen3.5:9b"),
         DeclareLaunchArgument("default_camera_name", default_value="camera0"),
         DeclareLaunchArgument("default_camera_topic", default_value="/camera0/color/image_raw"),
@@ -33,6 +37,10 @@ def generate_launch_description() -> LaunchDescription:
             {
                 "service_name": LaunchConfiguration("service_name"),
                 "ollama_base_url": LaunchConfiguration("ollama_base_url"),
+                "use_openai_vlm": LaunchConfiguration("use_openai_vlm"),
+                "openai_api_url": LaunchConfiguration("openai_api_url"),
+                "openai_api_key_env": LaunchConfiguration("openai_api_key_env"),
+                "openai_model": LaunchConfiguration("openai_model"),
                 "vlm_model": LaunchConfiguration("vlm_model"),
                 "default_camera_name": LaunchConfiguration("default_camera_name"),
                 "default_camera_topic": LaunchConfiguration("default_camera_topic"),

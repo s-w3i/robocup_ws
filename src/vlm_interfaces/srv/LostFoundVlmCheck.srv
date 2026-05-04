@@ -1,0 +1,14 @@
+string object_name
+string location_name
+string image_path
+string camera_name
+float32 confidence_threshold
+---
+bool success
+string message
+bool found
+float32 confidence
+string reason
+string image_path
+string camera_used
+string data_text

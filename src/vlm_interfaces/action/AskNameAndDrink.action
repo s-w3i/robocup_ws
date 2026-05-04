@@ -8,6 +8,8 @@ string task
 string reason
 string name
 string drink
+string food_flavour_preference
+string food_allergy
 string robot_text
 string last_user_input
 bool spoke_response
@@ -19,5 +21,7 @@ string stage
 string robot_text
 string name
 string drink
+string food_flavour_preference
+string food_allergy
 string user_input
 int32 attempt_count

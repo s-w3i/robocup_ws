@@ -195,7 +195,9 @@ class BtMonitorWindow(QtWidgets.QMainWindow):
                 f"{snapshot.tree_id}\n"
                 f"  event={snapshot.event} tick={snapshot.tick_count} "
                 f"name={summary.get('name', '') or '-'} "
-                f"drink={summary.get('drink', '') or '-'}"
+                f"drink={summary.get('drink', '') or '-'} "
+                f"flavour={summary.get('food_flavour_preference', '') or '-'} "
+                f"allergy={summary.get('food_allergy', '') or '-'}"
             )
             item = QtWidgets.QListWidgetItem(label)
             item.setData(QtCore.Qt.UserRole, snapshot.tree_id)
@@ -247,6 +249,8 @@ class BtMonitorWindow(QtWidgets.QMainWindow):
                 f"task: {summary.get('task', '')}",
                 f"name: {summary.get('name', '')}",
                 f"drink: {summary.get('drink', '')}",
+                f"food_flavour_preference: {summary.get('food_flavour_preference', '')}",
+                f"food_allergy: {summary.get('food_allergy', '')}",
                 f"llm_complete: {summary.get('llm_complete', False)}",
                 f"llm_continue_conversation: {summary.get('llm_continue_conversation', True)}",
                 f"last_user_input: {summary.get('last_user_input', '')}",

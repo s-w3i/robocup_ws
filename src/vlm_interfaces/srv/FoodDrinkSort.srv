@@ -1,0 +1,11 @@
+string camera_name
+float32 confidence_threshold
+---
+bool success
+string message
+string camera_used
+string image_path
+string announcement
+string[] food_items
+string[] drink_items
+string data_text

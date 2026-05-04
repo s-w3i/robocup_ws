@@ -3,6 +3,11 @@
 
 This node loads YOLOE once and supports single-shot detection via
 service (/yoloe/detect_prompt).
+
+Edited version:
+- keeps final published TF parent frame as base_link
+- improves object position estimation using segmentation-mask depth points
+- falls back to box-center depth when mask-based estimation is insufficient
 """
 
 from __future__ import annotations
@@ -13,10 +18,12 @@ import math
 import os
 import pathlib
 import re
+import shutil
 import sys
 import sysconfig
 import threading
 import time
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -26,9 +33,11 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import PoseStamped, TransformStamped
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
+from rclpy.wait_for_message import wait_for_message
 from sensor_msgs.msg import CameraInfo, Image
 from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformListener
 
@@ -122,6 +131,154 @@ def preload_cupti_if_needed() -> None:
                 continue
 
 
+_ULTRALYTICS_TEXT_ASSET_NAMES = frozenset({"mobileclip2_b.ts", "mobileclip_blt.ts"})
+_ULTRALYTICS_TEXT_ASSET_CACHE_DIR = (
+    pathlib.Path.home() / ".cache" / "yoloe_detection_service" / "ultralytics_assets"
+)
+_ULTRALYTICS_TEXT_ASSET_PATCH_LOCK = threading.Lock()
+
+
+def _is_valid_torchscript_archive(path: pathlib.Path) -> bool:
+    """Return True when the asset is a readable TorchScript zip archive."""
+    try:
+        return path.is_file() and zipfile.is_zipfile(path)
+    except OSError:
+        return False
+
+
+def _iter_ultralytics_text_asset_candidates(filename: str) -> list[pathlib.Path]:
+    """Collect likely MobileCLIP asset locations in priority order."""
+    candidates: list[pathlib.Path] = []
+    seen: set[str] = set()
+
+    search_dirs: list[pathlib.Path] = [_ULTRALYTICS_TEXT_ASSET_CACHE_DIR]
+
+    env_dir = os.environ.get("YOLOE_TEXT_ASSET_DIR", "").strip()
+    if env_dir:
+        search_dirs.append(pathlib.Path(env_dir).expanduser())
+
+    search_dirs.append(pathlib.Path.cwd())
+    home_dir = pathlib.Path.home()
+    search_dirs.extend([home_dir, home_dir / "robocup_ws"])
+
+    virtual_env = os.environ.get("VIRTUAL_ENV", "").strip()
+    if virtual_env:
+        search_dirs.append(pathlib.Path(virtual_env).expanduser())
+
+    search_dirs.extend(pathlib.Path(__file__).resolve().parents)
+
+    try:
+        from ultralytics.utils import SETTINGS
+
+        search_dirs.append(pathlib.Path(str(SETTINGS["weights_dir"])).expanduser())
+    except Exception:
+        pass
+
+    for directory in search_dirs:
+        try:
+            normalized_dir = str(directory.expanduser().resolve())
+        except OSError:
+            normalized_dir = str(directory.expanduser())
+        if normalized_dir in seen:
+            continue
+        seen.add(normalized_dir)
+        candidates.append(pathlib.Path(normalized_dir) / filename)
+    return candidates
+
+
+def _resolve_ultralytics_text_asset(
+    filename: str,
+    download_fn: Any,
+    *,
+    repo: str = "ultralytics/assets",
+    release: str = "v8.4.0",
+    **kwargs: Any,
+) -> pathlib.Path:
+    """Resolve a valid MobileCLIP asset without depending on the process cwd."""
+    if filename not in _ULTRALYTICS_TEXT_ASSET_NAMES:
+        raise ValueError(f"Unsupported Ultralytics text asset: {filename}")
+
+    target_path = _ULTRALYTICS_TEXT_ASSET_CACHE_DIR / filename
+    if _is_valid_torchscript_archive(target_path):
+        return target_path.resolve()
+
+    for candidate in _iter_ultralytics_text_asset_candidates(filename):
+        if candidate == target_path:
+            continue
+        if not _is_valid_torchscript_archive(candidate):
+            continue
+
+        _ULTRALYTICS_TEXT_ASSET_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        if target_path.exists() or target_path.is_symlink():
+            target_path.unlink()
+        try:
+            target_path.symlink_to(candidate.resolve())
+        except OSError:
+            shutil.copy2(candidate, target_path)
+        return target_path.resolve()
+
+    _ULTRALYTICS_TEXT_ASSET_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if target_path.exists() or target_path.is_symlink():
+        target_path.unlink()
+
+    downloaded_path = pathlib.Path(
+        download_fn(str(target_path), repo=repo, release=release, **kwargs)
+    ).expanduser()
+    if not _is_valid_torchscript_archive(downloaded_path):
+        raise RuntimeError(
+            f"Resolved Ultralytics text asset is invalid: {downloaded_path}"
+        )
+    return downloaded_path.resolve()
+
+
+def configure_ultralytics_text_asset_resolution(
+    preload_names: tuple[str, ...] = ("mobileclip2_b.ts",),
+) -> dict[str, pathlib.Path]:
+    """Patch Ultralytics asset lookup so MobileCLIP files always resolve to validated paths."""
+    import ultralytics.utils.downloads as downloads
+
+    with _ULTRALYTICS_TEXT_ASSET_PATCH_LOCK:
+        original_download = getattr(
+            downloads.attempt_download_asset,
+            "_yoloe_original_attempt_download_asset",
+            downloads.attempt_download_asset,
+        )
+
+        if not getattr(downloads.attempt_download_asset, "_yoloe_text_asset_patch", False):
+
+            def _patched_attempt_download_asset(
+                file: str | pathlib.Path,
+                repo: str = "ultralytics/assets",
+                release: str = "v8.4.0",
+                **kwargs: Any,
+            ) -> str:
+                cleaned = pathlib.Path(str(file).strip().replace("'", ""))
+                if cleaned.name in _ULTRALYTICS_TEXT_ASSET_NAMES:
+                    return str(
+                        _resolve_ultralytics_text_asset(
+                            cleaned.name,
+                            original_download,
+                            repo=repo,
+                            release=release,
+                            **kwargs,
+                        )
+                    )
+                return original_download(file, repo=repo, release=release, **kwargs)
+
+            _patched_attempt_download_asset._yoloe_text_asset_patch = True
+            _patched_attempt_download_asset._yoloe_original_attempt_download_asset = (
+                original_download
+            )
+            downloads.attempt_download_asset = _patched_attempt_download_asset
+
+        resolved_assets: dict[str, pathlib.Path] = {}
+        for name in preload_names:
+            if name not in _ULTRALYTICS_TEXT_ASSET_NAMES:
+                continue
+            resolved_assets[name] = _resolve_ultralytics_text_asset(name, original_download)
+        return resolved_assets
+
+
 @dataclass
 class DetectionEntry:
     class_name: str
@@ -157,6 +314,16 @@ class CameraStreamState:
     latest_depth_frame: str = ""
     latest_depth_encoding: str = ""
     latest_camera_info: CameraInfo | None = None
+    latest_color_received_s: float = 0.0
+    latest_depth_received_s: float = 0.0
+    latest_camera_info_received_s: float = 0.0
+
+
+@dataclass
+class CameraSubscriptionHandles:
+    color: Any
+    depth: Any
+    camera_info: Any
 
 
 @dataclass
@@ -165,13 +332,19 @@ class PublishedTFEntry:
     translation: np.ndarray
 
 
+@dataclass
+class CachedFrameTransform:
+    translation: np.ndarray
+    rotation_xyzw: tuple[float, float, float, float]
+
+
 class YoloeDetectionServiceNode(Node):
     def __init__(self) -> None:
         super().__init__("yoloe_detection_service_node")
 
         self.declare_parameter("service_name", "/yoloe/detect_prompt")
         self.declare_parameter("model_path", "/home/usern/yoloe-26l-seg.pt")
-        self.declare_parameter("bag_model_path", "/home/usern/Kevin_yolo/yolo26l-seg_bag.pt")
+        self.declare_parameter("bag_model_path", "/home/usern/Kevin_yolo/best_latest.pt")
         self.declare_parameter(
             "bag_prompt_aliases", ["bag", "paper bag", "brown paper bag", "paper bags"]
         )
@@ -191,19 +364,30 @@ class YoloeDetectionServiceNode(Node):
         self.declare_parameter("camera0_depth_topic", "")
         self.declare_parameter("camera0_camera_info_topic", "")
         self.declare_parameter("camera0_camera_link_frame", "")
-        self.declare_parameter("camera_color_topic", "/camera/color/image_raw")
-        self.declare_parameter("camera_depth_topic", "/camera/depth/image_raw")
-        self.declare_parameter("camera_camera_info_topic", "/camera/color/camera_info")
-        self.declare_parameter("camera_camera_link_frame", "camera_link")
+        self.declare_parameter("camera_color_topic", "/gripper_camera/color/image_raw")
+        self.declare_parameter("camera_depth_topic", "/gripper_camera/depth/image_raw")
+        self.declare_parameter("camera_camera_info_topic", "/gripper_camera/color/camera_info")
+        self.declare_parameter("camera_camera_link_frame", "gripper_camera_link")
 
         self.declare_parameter("pose_topic", "/yoloe/detected_pose")
         self.declare_parameter("object_frame_prefix", "")
         self.declare_parameter("save_dir", "/home/usern/robocup_ws/yoloe_out")
         self.declare_parameter("always_save_image", False)
+        self.declare_parameter("lazy_subscriptions", False)
+        self.declare_parameter("subscription_idle_timeout_sec", 3.0)
+        self.declare_parameter("subscription_poll_period_sec", 0.5)
+        self.declare_parameter("frame_wait_timeout_sec", 1.5)
+        self.declare_parameter("max_frame_age_sec", 0.75)
 
         self.declare_parameter("depth_window_size", 5)
         self.declare_parameter("min_depth_m", 0.05)
         self.declare_parameter("max_depth_m", 10.0)
+
+        # Added for mask-based 3D estimation
+        self.declare_parameter("mask_depth_stride", 3)
+        self.declare_parameter("mask_min_valid_points", 80)
+        self.declare_parameter("mask_max_points", 2500)
+        self.declare_parameter("mask_erode_pixels", 2)
 
         self.service_name = str(self.get_parameter("service_name").value)
         self.model_path = str(self.get_parameter("model_path").value)
@@ -223,6 +407,7 @@ class YoloeDetectionServiceNode(Node):
         self.default_camera_name = self._normalize_camera_name(
             str(self.get_parameter("default_camera_name").value)
         )
+        self.base_link_frame = "base_link"
 
         legacy_color_topic = str(self.get_parameter("color_topic").value)
         legacy_depth_topic = str(self.get_parameter("depth_topic").value)
@@ -250,8 +435,8 @@ class YoloeDetectionServiceNode(Node):
                 camera_info_topic=camera0_camera_info_topic,
                 camera_link_frame=camera0_camera_link_frame,
             ),
-            "camera": CameraStreamConfig(
-                name="camera",
+            "gripper_camera": CameraStreamConfig(
+                name="gripper_camera",
                 color_topic=str(self.get_parameter("camera_color_topic").value),
                 depth_topic=str(self.get_parameter("camera_depth_topic").value),
                 camera_info_topic=str(self.get_parameter("camera_camera_info_topic").value),
@@ -268,10 +453,27 @@ class YoloeDetectionServiceNode(Node):
         self.object_frame_prefix = str(self.get_parameter("object_frame_prefix").value)
         self.save_dir = pathlib.Path(str(self.get_parameter("save_dir").value)).expanduser().resolve()
         self.always_save_image = bool(self.get_parameter("always_save_image").value)
+        requested_lazy_subscriptions = bool(self.get_parameter("lazy_subscriptions").value)
+        self.lazy_subscriptions = False
+        self.subscription_idle_timeout_sec = max(
+            0.0, float(self.get_parameter("subscription_idle_timeout_sec").value)
+        )
+        self.subscription_poll_period_sec = max(
+            0.1, float(self.get_parameter("subscription_poll_period_sec").value)
+        )
+        self.frame_wait_timeout_sec = max(
+            0.1, float(self.get_parameter("frame_wait_timeout_sec").value)
+        )
+        self.max_frame_age_sec = max(0.05, float(self.get_parameter("max_frame_age_sec").value))
 
         self.depth_window_size = max(1, int(self.get_parameter("depth_window_size").value))
         self.min_depth_m = float(self.get_parameter("min_depth_m").value)
         self.max_depth_m = float(self.get_parameter("max_depth_m").value)
+
+        self.mask_depth_stride = max(1, int(self.get_parameter("mask_depth_stride").value))
+        self.mask_min_valid_points = max(10, int(self.get_parameter("mask_min_valid_points").value))
+        self.mask_max_points = max(100, int(self.get_parameter("mask_max_points").value))
+        self.mask_erode_pixels = max(0, int(self.get_parameter("mask_erode_pixels").value))
 
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -282,9 +484,13 @@ class YoloeDetectionServiceNode(Node):
         self._camera_states = {
             camera_name: CameraStreamState() for camera_name in self._camera_configs
         }
-        self._camera_subscriptions: list[Any] = []
+        self._camera_subscriptions: dict[str, CameraSubscriptionHandles] = {}
+        self._camera_subscription_deadlines: dict[str, float] = {}
+        self._active_detect_requests = 0
 
         self._last_tf_map: dict[str, PublishedTFEntry] = {}
+        self._frame_transform_cache: dict[tuple[str, str], CachedFrameTransform] = {}
+        self._tf_lookup_timeout = Duration(seconds=0.2)
 
         self._model: Any = None
         self._prompt_key: tuple[str, ...] | None = None
@@ -299,20 +505,21 @@ class YoloeDetectionServiceNode(Node):
         self._tf_broadcaster = TransformBroadcaster(self)
 
         self._pose_pub = self.create_publisher(PoseStamped, self.pose_topic, 10)
-        for camera_name, config in self._camera_configs.items():
-            self._subscribe_camera_streams(camera_name, config)
-
         self.create_service(DetectObjectPrompt, self.service_name, self._handle_detect_request)
         self.create_timer(0.2, self._publish_last_tf)
 
         self._prepare_runtime()
         self._load_model(self.model_path, "default")
 
+        for camera_name, config in self._camera_configs.items():
+            self._subscribe_camera_streams(camera_name, config)
+
         self.get_logger().info(f"YOLOE service ready on {self.service_name}")
         self.get_logger().info(f"Default model path: {self.model_path}")
         self.get_logger().info(f"Bag model path: {self.bag_model_path}")
         self.get_logger().info(f"Device: {self._device}")
         self.get_logger().info(f"Default camera: {self.default_camera_name}")
+        self.get_logger().info(f"Published pose/TF frame: {self.base_link_frame}")
         for config in self._camera_configs.values():
             self.get_logger().info(
                 f"[{config.name}] color={config.color_topic} depth={config.depth_topic} "
@@ -320,29 +527,212 @@ class YoloeDetectionServiceNode(Node):
             )
         self.get_logger().info(f"Save dir: {self.save_dir}")
         self.get_logger().info(f"Always save image override: {self.always_save_image}")
+        if requested_lazy_subscriptions:
+            self.get_logger().warn(
+                "lazy_subscriptions parameter is ignored; persistent camera subscriptions are forced."
+            )
+        self.get_logger().info(
+            "Lazy subscriptions: %s (idle_timeout=%.2fs, frame_wait_timeout=%.2fs, "
+            "max_frame_age=%.2fs)"
+            % (
+                str(self.lazy_subscriptions).lower(),
+                self.subscription_idle_timeout_sec,
+                self.frame_wait_timeout_sec,
+                self.max_frame_age_sec,
+            )
+        )
 
     def _subscribe_camera_streams(self, camera_name: str, config: CameraStreamConfig) -> None:
-        self._camera_subscriptions.extend(
-            [
-                self.create_subscription(
-                    Image,
-                    config.color_topic,
-                    lambda msg, camera_name=camera_name: self._on_color_image(camera_name, msg),
-                    qos_profile_sensor_data,
-                ),
-                self.create_subscription(
-                    Image,
-                    config.depth_topic,
-                    lambda msg, camera_name=camera_name: self._on_depth_image(camera_name, msg),
-                    qos_profile_sensor_data,
-                ),
-                self.create_subscription(
-                    CameraInfo,
-                    config.camera_info_topic,
-                    lambda msg, camera_name=camera_name: self._on_camera_info(camera_name, msg),
-                    qos_profile_sensor_data,
-                ),
+        with self._lock:
+            if camera_name in self._camera_subscriptions:
+                if self.lazy_subscriptions:
+                    self._camera_subscription_deadlines[camera_name] = (
+                        time.monotonic() + self.subscription_idle_timeout_sec
+                    )
+                return
+
+        handles = CameraSubscriptionHandles(
+            color=self.create_subscription(
+                Image,
+                config.color_topic,
+                lambda msg, camera_name=camera_name: self._on_color_image(camera_name, msg),
+                qos_profile_sensor_data,
+            ),
+            depth=self.create_subscription(
+                Image,
+                config.depth_topic,
+                lambda msg, camera_name=camera_name: self._on_depth_image(camera_name, msg),
+                qos_profile_sensor_data,
+            ),
+            camera_info=self.create_subscription(
+                CameraInfo,
+                config.camera_info_topic,
+                lambda msg, camera_name=camera_name: self._on_camera_info(camera_name, msg),
+                qos_profile_sensor_data,
+            ),
+        )
+
+        with self._lock:
+            self._camera_subscriptions[camera_name] = handles
+            if self.lazy_subscriptions:
+                self._camera_subscription_deadlines[camera_name] = (
+                    time.monotonic() + self.subscription_idle_timeout_sec
+                )
+
+        self.get_logger().info(
+            f"[{camera_name}] Subscribed to camera streams on demand."
+        )
+
+    def _unsubscribe_camera_streams(self, camera_name: str) -> None:
+        with self._lock:
+            handles = self._camera_subscriptions.pop(camera_name, None)
+            self._camera_subscription_deadlines.pop(camera_name, None)
+
+        if handles is None:
+            return
+
+        for subscription in (handles.color, handles.depth, handles.camera_info):
+            try:
+                self.destroy_subscription(subscription)
+            except Exception:
+                pass
+
+        self.get_logger().info(f"[{camera_name}] Unsubscribed from idle camera streams.")
+
+    def _cleanup_idle_subscriptions(self) -> None:
+        if not self.lazy_subscriptions or self.subscription_idle_timeout_sec <= 0.0:
+            return
+
+        with self._lock:
+            if self._active_detect_requests > 0:
+                return
+
+        now = time.monotonic()
+        with self._lock:
+            expired_camera_names = [
+                camera_name
+                for camera_name, deadline in self._camera_subscription_deadlines.items()
+                if deadline <= now
             ]
+
+        for camera_name in expired_camera_names:
+            self._unsubscribe_camera_streams(camera_name)
+
+    def _touch_camera_subscription(self, camera_name: str) -> None:
+        if not self.lazy_subscriptions:
+            return
+        with self._lock:
+            if camera_name in self._camera_subscriptions:
+                self._camera_subscription_deadlines[camera_name] = (
+                    time.monotonic() + self.subscription_idle_timeout_sec
+                )
+
+    def _ensure_camera_ready(self, camera_name: str, *, timeout_sec: float) -> tuple[bool, str]:
+        if camera_name not in self._camera_configs:
+            return False, f"Unsupported camera_name '{camera_name}'."
+
+        config = self._camera_configs[camera_name]
+        self._subscribe_camera_streams(camera_name, config)
+        deadline = time.monotonic() + timeout_sec
+        stale_state_detected = False
+
+        while time.monotonic() < deadline:
+            self._touch_camera_subscription(camera_name)
+            now = time.monotonic()
+            with self._lock:
+                state = self._camera_states[camera_name]
+                has_color = state.latest_color_image is not None
+                has_depth = state.latest_depth_image is not None
+                has_camera_info = state.latest_camera_info is not None
+                color_fresh = has_color and (now - state.latest_color_received_s) <= self.max_frame_age_sec
+                depth_fresh = has_depth and (now - state.latest_depth_received_s) <= self.max_frame_age_sec
+                color_age = (now - state.latest_color_received_s) if has_color else -1.0
+                depth_age = (now - state.latest_depth_received_s) if has_depth else -1.0
+                camera_info_age = (now - state.latest_camera_info_received_s) if has_camera_info else -1.0
+
+            if has_color and has_depth and has_camera_info:
+                if not color_fresh or not depth_fresh:
+                    stale_state_detected = True
+                return True, ""
+
+            if color_fresh and depth_fresh and has_camera_info:
+                return True, ""
+
+            remaining_sec = max(0.0, deadline - time.monotonic())
+            if remaining_sec <= 0.0:
+                break
+
+            missing_topic_fetched = False
+            if not has_color:
+                received, msg = wait_for_message(
+                    Image,
+                    self,
+                    config.color_topic,
+                    qos_profile=qos_profile_sensor_data,
+                    time_to_wait=min(0.25, remaining_sec),
+                )
+                if received and msg is not None:
+                    self._on_color_image(camera_name, msg)
+                    missing_topic_fetched = True
+
+            remaining_sec = max(0.0, deadline - time.monotonic())
+            if remaining_sec <= 0.0:
+                break
+
+            if not has_depth:
+                received, msg = wait_for_message(
+                    Image,
+                    self,
+                    config.depth_topic,
+                    qos_profile=qos_profile_sensor_data,
+                    time_to_wait=min(0.25, remaining_sec),
+                )
+                if received and msg is not None:
+                    self._on_depth_image(camera_name, msg)
+                    missing_topic_fetched = True
+
+            remaining_sec = max(0.0, deadline - time.monotonic())
+            if remaining_sec <= 0.0:
+                break
+
+            if not has_camera_info:
+                received, msg = wait_for_message(
+                    CameraInfo,
+                    self,
+                    config.camera_info_topic,
+                    qos_profile=qos_profile_sensor_data,
+                    time_to_wait=min(0.25, remaining_sec),
+                )
+                if received and msg is not None:
+                    self._on_camera_info(camera_name, msg)
+                    missing_topic_fetched = True
+
+            if not missing_topic_fetched:
+                time.sleep(0.05)
+
+        with self._lock:
+            state = self._camera_states[camera_name]
+            if state.latest_color_image is None:
+                return False, f"No image received on {config.color_topic}."
+            if state.latest_depth_image is None:
+                return (
+                    False,
+                    f"No depth image received on {config.depth_topic}. Set depth_registration:=true "
+                    "and verify topic publishing.",
+                )
+            if state.latest_camera_info is None:
+                return False, f"No camera info received on {config.camera_info_topic}."
+
+        if stale_state_detected:
+            self.get_logger().warn(
+                f"[{camera_name}] Using cached frames after freshness timeout. "
+                f"color_age={color_age:.2f}s depth_age={depth_age:.2f}s camera_info_age={camera_info_age:.2f}s"
+            )
+            return True, ""
+
+        return False, (
+            f"Timed out waiting for frames from camera '{camera_name}'. "
+            f"Increase frame_wait_timeout_sec or inspect topic rates."
         )
 
     def _prepare_runtime(self) -> None:
@@ -371,6 +761,10 @@ class YoloeDetectionServiceNode(Node):
         elapsed_s = time.perf_counter() - started
         self.get_logger().info(f"Loaded {model_name} model in {elapsed_s:.2f}s from {model_path}")
         if self._supports_prompt_classes:
+            resolved_assets = configure_ultralytics_text_asset_resolution()
+            asset_path = resolved_assets.get("mobileclip2_b.ts")
+            if asset_path is not None:
+                self.get_logger().info(f"Resolved MobileCLIP asset: {asset_path}")
             self.get_logger().info(f"{model_name.capitalize()} model supports YOLOE text prompts.")
         else:
             fixed_classes = ", ".join(str(name) for name in self._model.names.values())
@@ -415,7 +809,9 @@ class YoloeDetectionServiceNode(Node):
             return
 
         with self._lock:
-            self._camera_states[camera_name].latest_color_image = image
+            state = self._camera_states[camera_name]
+            state.latest_color_image = image
+            state.latest_color_received_s = time.monotonic()
 
     def _on_depth_image(self, camera_name: str, msg: Image) -> None:
         try:
@@ -429,10 +825,13 @@ class YoloeDetectionServiceNode(Node):
             state.latest_depth_image = depth
             state.latest_depth_frame = msg.header.frame_id
             state.latest_depth_encoding = msg.encoding
+            state.latest_depth_received_s = time.monotonic()
 
     def _on_camera_info(self, camera_name: str, msg: CameraInfo) -> None:
         with self._lock:
-            self._camera_states[camera_name].latest_camera_info = msg
+            state = self._camera_states[camera_name]
+            state.latest_camera_info = msg
+            state.latest_camera_info_received_s = time.monotonic()
 
     def _handle_detect_request(
         self, request: DetectObjectPrompt.Request, response: DetectObjectPrompt.Response
@@ -443,6 +842,7 @@ class YoloeDetectionServiceNode(Node):
         response.confidences = []
         response.poses_camera_link = []
         response.tf_child_frames = []
+        response.selected_side = ""
         response.saved_image_path = ""
         response.detections_in_frame = 0
         response.tf_published_count = 0
@@ -455,14 +855,26 @@ class YoloeDetectionServiceNode(Node):
             return response
 
         try:
+            with self._lock:
+                self._active_detect_requests += 1
             camera_name = self._resolve_camera_name(request.camera_name)
         except ValueError as exc:
             response.message = str(exc)
+            with self._lock:
+                self._active_detect_requests = max(0, self._active_detect_requests - 1)
             return response
 
-        config = self._camera_configs[camera_name]
-        use_bag_model = self._is_bag_only_request(prompts)
         try:
+            ready, ready_message = self._ensure_camera_ready(
+                camera_name,
+                timeout_sec=self.frame_wait_timeout_sec,
+            )
+            if not ready:
+                response.message = ready_message
+                return response
+
+            use_bag_model = self._is_bag_only_request(prompts)
+            self._touch_camera_subscription(camera_name)
             run_result = self._run_detection(
                 camera_name,
                 prompts,
@@ -474,10 +886,13 @@ class YoloeDetectionServiceNode(Node):
             response.message = f"Detection request failed: {exc}"
             return response
         finally:
-            if use_bag_model:
+            with self._lock:
+                self._active_detect_requests = max(0, self._active_detect_requests - 1)
+            if 'use_bag_model' in locals() and use_bag_model:
                 with self._inference_lock:
                     if self._loaded_model_path == self.bag_model_path:
                         self._unload_model()
+
         response.detections_in_frame = run_result.detections_in_frame
         response.tf_published_count = run_result.tf_published_count
         response.inference_ms = run_result.inference_ms
@@ -496,7 +911,7 @@ class YoloeDetectionServiceNode(Node):
         response.success = True
         response.message = (
             f"Published {response.tf_published_count}/{response.detections_in_frame} TF frames in "
-            f"{config.camera_link_frame} using camera '{camera_name}'."
+            f"{self.base_link_frame} using camera '{camera_name}'."
         )
         if run_result.skipped_count > 0:
             response.message += (
@@ -674,30 +1089,36 @@ class YoloeDetectionServiceNode(Node):
             confidence = float(box.conf.item())
 
             x1, y1, x2, y2 = [float(value) for value in box.xyxy[0].tolist()]
-            u = int(round((x1 + x2) * 0.5))
-            v = int(round((y1 + y2) * 0.5))
 
-            if u < 0 or v < 0 or u >= depth_image.shape[1] or v >= depth_image.shape[0]:
-                skipped_count += 1
-                continue
-
-            depth_m = self._sample_depth_meters(depth_image, depth_encoding, u, v)
-            if depth_m is None:
-                skipped_count += 1
-                continue
-
-            point_in_depth = np.array(
-                [
-                    ((float(u) - cx) / fx) * depth_m,
-                    ((float(v) - cy) / fy) * depth_m,
-                    depth_m,
-                ],
-                dtype=np.float64,
+            point_in_depth = self._compute_object_point_in_depth_frame(
+                result=result,
+                detection_index=int(idx),
+                depth_image=depth_image,
+                depth_encoding=depth_encoding,
+                fx=fx,
+                fy=fy,
+                cx=cx,
+                cy=cy,
+                x1=x1,
+                y1=y1,
+                x2=x2,
+                y2=y2,
             )
+            if point_in_depth is None:
+                skipped_count += 1
+                continue
+
             point_in_camera = self._transform_point_to_frame(
                 point_in_depth, depth_frame, config.camera_link_frame
             )
             if point_in_camera is None:
+                skipped_count += 1
+                continue
+
+            point_in_base = self._transform_point_to_frame(
+                point_in_camera, config.camera_link_frame, self.base_link_frame
+            )
+            if point_in_base is None:
                 skipped_count += 1
                 continue
 
@@ -711,19 +1132,19 @@ class YoloeDetectionServiceNode(Node):
                 child_frame = f"{class_slug}_{class_count}"
 
             pose_msg = PoseStamped()
-            pose_msg.header.frame_id = config.camera_link_frame
+            pose_msg.header.frame_id = self.base_link_frame
             pose_msg.header.stamp = now_msg
-            pose_msg.pose.position.x = float(point_in_camera[0])
-            pose_msg.pose.position.y = float(point_in_camera[1])
-            pose_msg.pose.position.z = float(point_in_camera[2])
+            pose_msg.pose.position.x = float(point_in_base[0])
+            pose_msg.pose.position.y = float(point_in_base[1])
+            pose_msg.pose.position.z = float(point_in_base[2])
             pose_msg.pose.orientation.w = 1.0
 
             self._pose_pub.publish(pose_msg)
-            self._publish_tf(child_frame, point_in_camera, config.camera_link_frame)
+            self._publish_tf(child_frame, point_in_base, self.base_link_frame)
 
             frame_map[child_frame] = PublishedTFEntry(
-                parent_frame=config.camera_link_frame,
-                translation=point_in_camera.copy(),
+                parent_frame=self.base_link_frame,
+                translation=point_in_base.copy(),
             )
             entries.append(DetectionEntry(class_name, confidence, pose_msg, child_frame))
             break
@@ -755,6 +1176,166 @@ class YoloeDetectionServiceNode(Node):
             saved_path,
             skipped_count,
             "",
+        )
+
+    def _extract_mask_for_detection(
+        self,
+        result: Any,
+        detection_index: int,
+        target_shape: tuple[int, int],
+    ) -> np.ndarray | None:
+        if result.masks is None or result.masks.data is None:
+            return None
+
+        if detection_index < 0 or detection_index >= len(result.masks.data):
+            return None
+
+        try:
+            mask = result.masks.data[detection_index].detach().cpu().numpy()
+        except Exception:
+            return None
+
+        if mask.ndim != 2:
+            return None
+
+        mask_bin = (mask > 0.5).astype(np.uint8)
+        target_h, target_w = target_shape
+
+        if mask_bin.shape[0] != target_h or mask_bin.shape[1] != target_w:
+            mask_bin = cv2.resize(
+                mask_bin,
+                (target_w, target_h),
+                interpolation=cv2.INTER_NEAREST,
+            )
+
+        if self.mask_erode_pixels > 0:
+            kernel_size = 2 * self.mask_erode_pixels + 1
+            kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+            mask_bin = cv2.erode(mask_bin, kernel, iterations=1)
+
+        if int(mask_bin.sum()) == 0:
+            return None
+
+        return mask_bin
+
+    def _compute_mask_3d_point_in_depth_frame(
+        self,
+        mask: np.ndarray,
+        depth_image: np.ndarray,
+        depth_encoding: str,
+        fx: float,
+        fy: float,
+        cx: float,
+        cy: float,
+    ) -> np.ndarray | None:
+        ys, xs = np.nonzero(mask)
+        if len(xs) == 0:
+            return None
+
+        stride = max(1, self.mask_depth_stride)
+        if stride > 1:
+            xs = xs[::stride]
+            ys = ys[::stride]
+
+        if len(xs) > self.mask_max_points:
+            step = int(math.ceil(len(xs) / float(self.mask_max_points)))
+            xs = xs[::step]
+            ys = ys[::step]
+
+        points: list[np.ndarray] = []
+
+        for u, v in zip(xs, ys):
+            depth_m = self._depth_value_to_meters(
+                depth_image[v, u],
+                depth_encoding,
+                depth_image.dtype,
+            )
+            if depth_m is None:
+                continue
+            if depth_m < self.min_depth_m or depth_m > self.max_depth_m:
+                continue
+
+            x = ((float(u) - cx) / fx) * depth_m
+            y = ((float(v) - cy) / fy) * depth_m
+            z = depth_m
+            points.append(np.array([x, y, z], dtype=np.float64))
+
+        if len(points) < self.mask_min_valid_points:
+            return None
+
+        point_array = np.asarray(points, dtype=np.float64)
+
+        median_z = float(np.median(point_array[:, 2]))
+        abs_dev_z = np.abs(point_array[:, 2] - median_z)
+        mad_z = float(np.median(abs_dev_z))
+
+        if mad_z > 1e-6:
+            inlier_mask = abs_dev_z <= (2.5 * 1.4826 * mad_z)
+            filtered = point_array[inlier_mask]
+            if len(filtered) >= max(10, self.mask_min_valid_points // 2):
+                point_array = filtered
+
+        return np.median(point_array, axis=0)
+
+    def _compute_object_point_in_depth_frame(
+        self,
+        result: Any,
+        detection_index: int,
+        depth_image: np.ndarray,
+        depth_encoding: str,
+        fx: float,
+        fy: float,
+        cx: float,
+        cy: float,
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+    ) -> np.ndarray | None:
+        mask = self._extract_mask_for_detection(
+            result,
+            detection_index,
+            depth_image.shape[:2],
+        )
+        if mask is not None:
+            mask_point = self._compute_mask_3d_point_in_depth_frame(
+                mask,
+                depth_image,
+                depth_encoding,
+                fx,
+                fy,
+                cx,
+                cy,
+            )
+            if mask_point is not None:
+                return mask_point
+
+        u = int(round((x1 + x2) * 0.5))
+        v = int(round((y1 + y2) * 0.5))
+
+        if u < 0 or v < 0 or u >= depth_image.shape[1] or v >= depth_image.shape[0]:
+            return None
+
+        depth_m = self._sample_depth_meters(depth_image, depth_encoding, u, v)
+        if depth_m is None:
+            depth_m = self._sample_depth_from_box_meters(
+                depth_image,
+                depth_encoding,
+                x1,
+                y1,
+                x2,
+                y2,
+            )
+        if depth_m is None:
+            return None
+
+        return np.array(
+            [
+                ((float(u) - cx) / fx) * depth_m,
+                ((float(v) - cy) / fy) * depth_m,
+                depth_m,
+            ],
+            dtype=np.float64,
         )
 
     def _publish_last_tf(self) -> None:
@@ -804,30 +1385,64 @@ class YoloeDetectionServiceNode(Node):
         if source_frame == target_frame or source_frame == "":
             return point_in_source
 
+        cache_key = (target_frame, source_frame)
         try:
             transform = self._tf_buffer.lookup_transform(
                 target_frame,
                 source_frame,
                 Time(),
+                timeout=self._tf_lookup_timeout,
             )
+            cached_transform = CachedFrameTransform(
+                translation=np.array(
+                    [
+                        transform.transform.translation.x,
+                        transform.transform.translation.y,
+                        transform.transform.translation.z,
+                    ],
+                    dtype=np.float64,
+                ),
+                rotation_xyzw=(
+                    transform.transform.rotation.x,
+                    transform.transform.rotation.y,
+                    transform.transform.rotation.z,
+                    transform.transform.rotation.w,
+                ),
+            )
+            with self._lock:
+                self._frame_transform_cache[cache_key] = CachedFrameTransform(
+                    translation=cached_transform.translation.copy(),
+                    rotation_xyzw=cached_transform.rotation_xyzw,
+                )
         except TransformException as exc:
-            self.get_logger().warn(f"TF lookup failed ({source_frame} -> {target_frame}): {exc}")
-            return None
+            with self._lock:
+                cached_transform = self._frame_transform_cache.get(cache_key)
+                if cached_transform is not None:
+                    cached_transform = CachedFrameTransform(
+                        translation=cached_transform.translation.copy(),
+                        rotation_xyzw=cached_transform.rotation_xyzw,
+                    )
+            if cached_transform is None:
+                self.get_logger().warn(f"TF lookup failed ({source_frame} -> {target_frame}): {exc}")
+                return None
 
-        rotation = transform.transform.rotation
-        translation = transform.transform.translation
+            self.get_logger().warn(
+                f"TF lookup failed ({source_frame} -> {target_frame}); using cached transform: {exc}"
+            )
 
+        return self._apply_cached_transform(point_in_source, cached_transform)
+
+    def _apply_cached_transform(
+        self, point_in_source: np.ndarray, cached_transform: CachedFrameTransform
+    ) -> np.ndarray:
         rotated = self._rotate_vector_by_quaternion(
             point_in_source,
-            rotation.x,
-            rotation.y,
-            rotation.z,
-            rotation.w,
+            cached_transform.rotation_xyzw[0],
+            cached_transform.rotation_xyzw[1],
+            cached_transform.rotation_xyzw[2],
+            cached_transform.rotation_xyzw[3],
         )
-        transformed = rotated + np.array(
-            [translation.x, translation.y, translation.z], dtype=np.float64
-        )
-        return transformed
+        return rotated + cached_transform.translation
 
     def _resolve_camera_name(self, requested_camera_name: str) -> str:
         camera_name = self._normalize_camera_name(requested_camera_name)
@@ -904,6 +1519,47 @@ class YoloeDetectionServiceNode(Node):
             return None
 
         return float(np.median(values))
+
+    def _sample_depth_from_box_meters(
+        self,
+        depth_image: np.ndarray,
+        encoding: str,
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+    ) -> float | None:
+        height, width = depth_image.shape[:2]
+        min_x = max(0, int(math.floor(min(x1, x2))))
+        max_x = min(width - 1, int(math.ceil(max(x1, x2))))
+        min_y = max(0, int(math.floor(min(y1, y2))))
+        max_y = min(height - 1, int(math.ceil(max(y1, y2))))
+        if min_x > max_x or min_y > max_y:
+            return None
+
+        trim_x = max(0, int((max_x - min_x + 1) * 0.15))
+        trim_y = max(0, int((max_y - min_y + 1) * 0.15))
+        inner_min_x = min(max_x, min_x + trim_x)
+        inner_max_x = max(min_x, max_x - trim_x)
+        inner_min_y = min(max_y, min_y + trim_y)
+        inner_max_y = max(min_y, max_y - trim_y)
+
+        values: list[float] = []
+        for yy in range(inner_min_y, inner_max_y + 1):
+            for xx in range(inner_min_x, inner_max_x + 1):
+                depth_m = self._depth_value_to_meters(
+                    depth_image[yy, xx], encoding, depth_image.dtype
+                )
+                if depth_m is None:
+                    continue
+                if depth_m < self.min_depth_m or depth_m > self.max_depth_m:
+                    continue
+                values.append(depth_m)
+
+        if not values:
+            return None
+
+        return float(np.percentile(values, 25.0 if len(values) >= 8 else 50.0))
 
     @staticmethod
     def _depth_value_to_meters(
@@ -1017,6 +1673,11 @@ class YoloeDetectionServiceNode(Node):
         cv2.imwrite(str(path), image)
         self.get_logger().info(f"Saved detection image: {path}")
         return str(path)
+
+    def destroy_node(self) -> bool:
+        for camera_name in list(self._camera_configs):
+            self._unsubscribe_camera_streams(camera_name)
+        return super().destroy_node()
 
 
 def main(args: list[str] | None = None) -> None:

@@ -19,15 +19,18 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import PoseStamped, TransformStamped
+from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
+from rclpy.wait_for_message import wait_for_message
 from sensor_msgs.msg import CameraInfo, Image
 from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformListener
 
 from yoloe_detection_interfaces.srv import DetectObjectPrompt
 from yoloe_detection_service.yoloe_detection_service_node import (
+    configure_ultralytics_text_asset_resolution,
     ensure_torch_runtime_libs,
     preload_cupti_if_needed,
 )
@@ -51,12 +54,19 @@ class PointedDetection:
     confidence: float
     box_xyxy: tuple[int, int, int, int]
     center_uv: tuple[int, int]
+    selected_side: str
     cue_source: str
     cue_side: str
     tip_uv: tuple[int, int]
     ray_end_uv: tuple[int, int]
     score: float
     object_depth_m: float | None
+
+
+@dataclass(frozen=True)
+class BodyReference:
+    left_shoulder_uv: tuple[int, int]
+    right_shoulder_uv: tuple[int, int]
 
 
 @dataclass
@@ -113,6 +123,13 @@ class PublishedTFEntry:
     translation: np.ndarray
 
 
+@dataclass
+class StreamSubscriptionHandles:
+    color: Any
+    depth: Any
+    camera_info: Any
+
+
 def inject_known_site_packages() -> None:
     """Add known site-packages paths for mixed-venv deployments."""
     candidates = [
@@ -131,7 +148,7 @@ class YoloePointedDetectionServiceNode(Node):
         super().__init__("yoloe_pointed_detection_service_node")
 
         self.declare_parameter("service_name", "/yoloe/detect_pointed_prompt")
-        self.declare_parameter("model_path", "/home/usern/Kevin_yolo/yolo26l-seg_bag.pt")
+        self.declare_parameter("model_path", "/home/usern/Kevin_yolo/best_latest.pt")
         self.declare_parameter(
             "bag_prompt_aliases", ["bag", "paper bag", "brown paper bag", "paper bags"]
         )
@@ -177,6 +194,11 @@ class YoloePointedDetectionServiceNode(Node):
         self.declare_parameter("ui_wait_ms", 1200)
         self.declare_parameter("save_dir", "/home/usern/robocup_ws/yoloe_out")
         self.declare_parameter("always_save_image", False)
+        self.declare_parameter("lazy_subscriptions", True)
+        self.declare_parameter("subscription_idle_timeout_sec", 3.0)
+        self.declare_parameter("subscription_poll_period_sec", 0.5)
+        self.declare_parameter("frame_wait_timeout_sec", 1.5)
+        self.declare_parameter("max_frame_age_sec", 0.75)
 
         self.service_name = str(self.get_parameter("service_name").value)
         self.model_path = str(self.get_parameter("model_path").value)
@@ -197,6 +219,7 @@ class YoloePointedDetectionServiceNode(Node):
         self.depth_topic = str(self.get_parameter("depth_topic").value)
         self.camera_info_topic = str(self.get_parameter("camera_info_topic").value)
         self.camera_link_frame = str(self.get_parameter("camera_link_frame").value)
+        self.output_frame = "map"
         self.pose_topic = str(self.get_parameter("pose_topic").value)
         self.result_image_topic = str(self.get_parameter("result_image_topic").value)
         self.object_frame_prefix = str(self.get_parameter("object_frame_prefix").value)
@@ -235,6 +258,17 @@ class YoloePointedDetectionServiceNode(Node):
         self.ui_wait_ms = max(1, int(self.get_parameter("ui_wait_ms").value))
         self.save_dir = pathlib.Path(str(self.get_parameter("save_dir").value)).expanduser().resolve()
         self.always_save_image = bool(self.get_parameter("always_save_image").value)
+        self.lazy_subscriptions = bool(self.get_parameter("lazy_subscriptions").value)
+        self.subscription_idle_timeout_sec = max(
+            0.0, float(self.get_parameter("subscription_idle_timeout_sec").value)
+        )
+        self.subscription_poll_period_sec = max(
+            0.1, float(self.get_parameter("subscription_poll_period_sec").value)
+        )
+        self.frame_wait_timeout_sec = max(
+            0.1, float(self.get_parameter("frame_wait_timeout_sec").value)
+        )
+        self.max_frame_age_sec = max(0.05, float(self.get_parameter("max_frame_age_sec").value))
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
         self._bridge = CvBridge()
@@ -250,12 +284,18 @@ class YoloePointedDetectionServiceNode(Node):
         self._latest_camera_info: CameraInfo | None = None
         self._latest_color_header = None
         self._latest_color_stamp_ns: int = -1
+        self._latest_color_received_s: float = 0.0
+        self._latest_depth_received_s: float = 0.0
+        self._latest_camera_info_received_s: float = 0.0
+        self._stream_subscriptions: StreamSubscriptionHandles | None = None
+        self._subscription_deadline_s: float = 0.0
 
         self._model: Any = None
         self._prompt_key: tuple[str, ...] | None = None
         self._supports_prompt_classes = False
         self._active_tf_map: dict[str, PublishedTFEntry] = {}
         self._device: str = "cpu"
+        self._tf_lookup_timeout = Duration(seconds=0.2)
 
         self._mp_hands = mp.solutions.hands
         self._hands = self._mp_hands.Hands(
@@ -287,13 +327,14 @@ class YoloePointedDetectionServiceNode(Node):
                 qos_profile_sensor_data,
             )
 
-        self.create_subscription(Image, self.color_topic, self._on_color_image, qos_profile_sensor_data)
-        self.create_subscription(Image, self.depth_topic, self._on_depth_image, qos_profile_sensor_data)
-        self.create_subscription(CameraInfo, self.camera_info_topic, self._on_camera_info, qos_profile_sensor_data)
         self.create_service(DetectObjectPrompt, self.service_name, self._handle_detect_request)
         self.create_timer(1.0 / self.tf_republish_hz, self._publish_active_tfs)
+        self.create_timer(self.subscription_poll_period_sec, self._cleanup_idle_subscriptions)
 
         self._load_model()
+
+        if not self.lazy_subscriptions:
+            self._subscribe_input_streams()
 
         self.get_logger().info(f"Pointed-object service ready on {self.service_name}")
         self.get_logger().info(f"Model path: {self.model_path}")
@@ -301,6 +342,7 @@ class YoloePointedDetectionServiceNode(Node):
         self.get_logger().info(f"Color topic: {self.color_topic}")
         self.get_logger().info(f"Depth topic: {self.depth_topic}")
         self.get_logger().info(f"Camera info topic: {self.camera_info_topic}")
+        self.get_logger().info(f"Published pose/TF frame: {self.output_frame}")
         self.get_logger().info(f"TF republish rate: {self.tf_republish_hz:.1f} Hz")
         self.get_logger().info(
             f"Hybrid pointing cues enabled: hand_cone={self.pointing_max_angle_deg:.1f} deg, "
@@ -309,6 +351,16 @@ class YoloePointedDetectionServiceNode(Node):
         self.get_logger().info(
             f"Voting: frames={self.vote_frames}, interval_ms={self.vote_interval_ms}, "
             f"min_ratio={self.vote_min_ratio:.2f}"
+        )
+        self.get_logger().info(
+            "Lazy subscriptions: %s (idle_timeout=%.2fs, frame_wait_timeout=%.2fs, "
+            "max_frame_age=%.2fs)"
+            % (
+                str(self.lazy_subscriptions).lower(),
+                self.subscription_idle_timeout_sec,
+                self.frame_wait_timeout_sec,
+                self.max_frame_age_sec,
+            )
         )
 
     def _load_model(self) -> None:
@@ -329,6 +381,10 @@ class YoloePointedDetectionServiceNode(Node):
         self.get_logger().info(f"Loaded YOLOE model in {elapsed_s:.2f}s")
         self.get_logger().info(f"Torch CUDA available: {torch.cuda.is_available()}")
         if self._supports_prompt_classes:
+            resolved_assets = configure_ultralytics_text_asset_resolution()
+            asset_path = resolved_assets.get("mobileclip2_b.ts")
+            if asset_path is not None:
+                self.get_logger().info(f"Resolved MobileCLIP asset: {asset_path}")
             self.get_logger().info("Pointed model supports YOLOE text prompts.")
         else:
             fixed_classes = ", ".join(str(name) for name in self._model.names.values())
@@ -343,6 +399,180 @@ class YoloePointedDetectionServiceNode(Node):
             return requested
         return "cuda" if torch_module.cuda.is_available() else "cpu"
 
+    def _subscribe_input_streams(self) -> None:
+        with self._lock:
+            if self._stream_subscriptions is not None:
+                if self.lazy_subscriptions:
+                    self._subscription_deadline_s = time.monotonic() + self.subscription_idle_timeout_sec
+                return
+
+        handles = StreamSubscriptionHandles(
+            color=self.create_subscription(
+                Image,
+                self.color_topic,
+                self._on_color_image,
+                qos_profile_sensor_data,
+            ),
+            depth=self.create_subscription(
+                Image,
+                self.depth_topic,
+                self._on_depth_image,
+                qos_profile_sensor_data,
+            ),
+            camera_info=self.create_subscription(
+                CameraInfo,
+                self.camera_info_topic,
+                self._on_camera_info,
+                qos_profile_sensor_data,
+            ),
+        )
+
+        with self._lock:
+            self._stream_subscriptions = handles
+            if self.lazy_subscriptions:
+                self._subscription_deadline_s = time.monotonic() + self.subscription_idle_timeout_sec
+
+        self.get_logger().info("Subscribed to pointed-detection camera streams on demand.")
+
+    def _unsubscribe_input_streams(self) -> None:
+        with self._lock:
+            handles = self._stream_subscriptions
+            self._stream_subscriptions = None
+            self._subscription_deadline_s = 0.0
+            self._latest_color_image = None
+            self._latest_depth_image = None
+            self._latest_depth_frame = ""
+            self._latest_depth_encoding = ""
+            self._latest_camera_info = None
+            self._latest_color_header = None
+            self._latest_color_stamp_ns = -1
+            self._latest_color_received_s = 0.0
+            self._latest_depth_received_s = 0.0
+            self._latest_camera_info_received_s = 0.0
+
+        if handles is None:
+            return
+
+        for subscription in (handles.color, handles.depth, handles.camera_info):
+            try:
+                self.destroy_subscription(subscription)
+            except Exception:
+                pass
+
+        self.get_logger().info("Unsubscribed from idle pointed-detection camera streams.")
+
+    def _cleanup_idle_subscriptions(self) -> None:
+        if not self.lazy_subscriptions or self.subscription_idle_timeout_sec <= 0.0:
+            return
+
+        with self._lock:
+            should_unsubscribe = (
+                self._stream_subscriptions is not None
+                and self._subscription_deadline_s > 0.0
+                and self._subscription_deadline_s <= time.monotonic()
+            )
+
+        if should_unsubscribe:
+            self._unsubscribe_input_streams()
+
+    def _touch_subscription_deadline(self) -> None:
+        if not self.lazy_subscriptions:
+            return
+        with self._lock:
+            if self._stream_subscriptions is not None:
+                self._subscription_deadline_s = time.monotonic() + self.subscription_idle_timeout_sec
+
+    def _ensure_inputs_ready(self, *, timeout_sec: float) -> tuple[bool, str]:
+        self._subscribe_input_streams()
+        deadline = time.monotonic() + timeout_sec
+        info_max_age_sec = max(self.max_frame_age_sec, self.frame_wait_timeout_sec)
+
+        while time.monotonic() < deadline:
+            self._touch_subscription_deadline()
+            now = time.monotonic()
+            with self._lock:
+                color_ready = (
+                    self._latest_color_image is not None
+                    and (now - self._latest_color_received_s) <= self.max_frame_age_sec
+                )
+                depth_ready = (
+                    self._latest_depth_image is not None
+                    and (now - self._latest_depth_received_s) <= self.max_frame_age_sec
+                )
+                camera_info_ready = (
+                    self._latest_camera_info is not None
+                    and (now - self._latest_camera_info_received_s) <= info_max_age_sec
+                )
+
+            if color_ready and depth_ready and camera_info_ready:
+                return True, ""
+
+            remaining_sec = max(0.0, deadline - time.monotonic())
+            if remaining_sec <= 0.0:
+                break
+
+            missing_topic_fetched = False
+            if not color_ready:
+                received, msg = wait_for_message(
+                    Image,
+                    self,
+                    self.color_topic,
+                    qos_profile=qos_profile_sensor_data,
+                    time_to_wait=min(0.25, remaining_sec),
+                )
+                if received and msg is not None:
+                    self._on_color_image(msg)
+                    missing_topic_fetched = True
+
+            remaining_sec = max(0.0, deadline - time.monotonic())
+            if remaining_sec <= 0.0:
+                break
+
+            if not depth_ready:
+                received, msg = wait_for_message(
+                    Image,
+                    self,
+                    self.depth_topic,
+                    qos_profile=qos_profile_sensor_data,
+                    time_to_wait=min(0.25, remaining_sec),
+                )
+                if received and msg is not None:
+                    self._on_depth_image(msg)
+                    missing_topic_fetched = True
+
+            remaining_sec = max(0.0, deadline - time.monotonic())
+            if remaining_sec <= 0.0:
+                break
+
+            if not camera_info_ready:
+                received, msg = wait_for_message(
+                    CameraInfo,
+                    self,
+                    self.camera_info_topic,
+                    qos_profile=qos_profile_sensor_data,
+                    time_to_wait=min(0.25, remaining_sec),
+                )
+                if received and msg is not None:
+                    self._on_camera_info(msg)
+                    missing_topic_fetched = True
+
+            if not missing_topic_fetched:
+                time.sleep(0.05)
+
+        with self._lock:
+            if self._latest_color_image is None:
+                return False, f"No image received on {self.color_topic}."
+            if self._latest_depth_image is None:
+                return False, f"No depth image received on {self.depth_topic}."
+            if self._latest_camera_info is None:
+                return False, f"No camera info received on {self.camera_info_topic}."
+
+        return (
+            False,
+            "Timed out waiting for fresh pointed-detection inputs. "
+            "Increase frame_wait_timeout_sec or inspect topic rates.",
+        )
+
     def _on_color_image(self, msg: Image) -> None:
         try:
             image = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
@@ -355,6 +585,7 @@ class YoloePointedDetectionServiceNode(Node):
             self._latest_color_image = image
             self._latest_color_header = msg.header
             self._latest_color_stamp_ns = stamp_ns
+            self._latest_color_received_s = time.monotonic()
 
     def _on_depth_image(self, msg: Image) -> None:
         try:
@@ -367,10 +598,12 @@ class YoloePointedDetectionServiceNode(Node):
             self._latest_depth_image = depth
             self._latest_depth_frame = msg.header.frame_id
             self._latest_depth_encoding = msg.encoding
+            self._latest_depth_received_s = time.monotonic()
 
     def _on_camera_info(self, msg: CameraInfo) -> None:
         with self._lock:
             self._latest_camera_info = msg
+            self._latest_camera_info_received_s = time.monotonic()
 
     def _handle_detect_request(
         self, request: DetectObjectPrompt.Request, response: DetectObjectPrompt.Response
@@ -381,6 +614,7 @@ class YoloePointedDetectionServiceNode(Node):
         response.confidences = []
         response.poses_camera_link = []
         response.tf_child_frames = []
+        response.selected_side = ""
         response.saved_image_path = ""
         response.detections_in_frame = 0
         response.tf_published_count = 0
@@ -399,6 +633,11 @@ class YoloePointedDetectionServiceNode(Node):
             )
             return response
 
+        ready, ready_message = self._ensure_inputs_ready(timeout_sec=self.frame_wait_timeout_sec)
+        if not ready:
+            response.message = ready_message
+            return response
+
         run_result = self._run_detection(prompts, request.save_image)
         response.detections_in_frame = run_result.detections_in_frame
         response.tf_published_count = run_result.tf_published_count
@@ -415,6 +654,7 @@ class YoloePointedDetectionServiceNode(Node):
         response.confidences = [run_result.selected.confidence]
         response.poses_camera_link = [run_result.pose_camera_link]
         response.tf_child_frames = [run_result.tf_child_frame] if run_result.tf_child_frame else []
+        response.selected_side = run_result.selected.selected_side
         return response
 
     def _run_detection(self, prompts: list[str], save_image_request: bool) -> DetectionRunResult:
@@ -597,18 +837,53 @@ class YoloePointedDetectionServiceNode(Node):
         final_point = final_decision.point_in_camera
         assert final_selected is not None
         assert final_point is not None
+        final_point_output = self._transform_point_to_frame(
+            final_point,
+            self.camera_link_frame,
+            self.output_frame,
+        )
+        if final_point_output is None:
+            annotated = final_decision.annotated.copy()
+            cv2.putText(
+                annotated,
+                f"{self.camera_link_frame}->{self.output_frame} TF unavailable",
+                (12, 112),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 165, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            saved_path = self._publish_ui_outputs(
+                annotated=annotated,
+                color_header=final_decision.color_header,
+                prompts=prompts,
+                label="no_valid_map_tf",
+                save_image_request=save_image_request,
+            )
+            return DetectionRunResult(
+                False,
+                f"Failed TF transform from {self.camera_link_frame} to {self.output_frame}.",
+                None,
+                None,
+                "",
+                max_detections,
+                0,
+                avg_inference_ms,
+                saved_path,
+            )
 
         pose_msg = PoseStamped()
-        pose_msg.header.frame_id = self.camera_link_frame
+        pose_msg.header.frame_id = self.output_frame
         pose_msg.header.stamp = self.get_clock().now().to_msg()
-        pose_msg.pose.position.x = float(final_point[0])
-        pose_msg.pose.position.y = float(final_point[1])
-        pose_msg.pose.position.z = float(final_point[2])
+        pose_msg.pose.position.x = float(final_point_output[0])
+        pose_msg.pose.position.y = float(final_point_output[1])
+        pose_msg.pose.position.z = float(final_point_output[2])
         pose_msg.pose.orientation.w = 1.0
         self._safe_publish(self._pose_pub, pose_msg)
 
         child_frame = f"{self.object_frame_prefix}_{self._slug(final_selected.class_name)}"
-        self._publish_tf(child_frame, final_point)
+        self._publish_tf(child_frame, final_point_output)
 
         annotated = final_decision.annotated.copy()
         cv2.putText(
@@ -621,6 +896,20 @@ class YoloePointedDetectionServiceNode(Node):
             2,
             cv2.LINE_AA,
         )
+        cv2.putText(
+            annotated,
+            (
+                f"Output {self.output_frame}: "
+                f"[{final_point_output[0]:.2f}, {final_point_output[1]:.2f}, "
+                f"{final_point_output[2]:.2f}] m"
+            ),
+            (12, 114),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (255, 220, 0),
+            2,
+            cv2.LINE_AA,
+        )
         saved_path = self._publish_ui_outputs(
             annotated=annotated,
             color_header=final_decision.color_header,
@@ -630,10 +919,11 @@ class YoloePointedDetectionServiceNode(Node):
         )
 
         message = (
-            f"Selected '{final_selected.class_name}' via {final_selected.cue_side}/{final_selected.cue_source} "
+            f"Selected '{final_selected.class_name}' on person's {final_selected.selected_side} "
+            f"via {final_selected.cue_side}/{final_selected.cue_source} "
             f"cue. Votes {winner_vote.count}/{len(frame_decisions)}. "
-            f"Centroid [{final_point[0]:.3f}, {final_point[1]:.3f}, {final_point[2]:.3f}] m "
-            f"in {self.camera_link_frame}."
+            f"Centroid [{final_point_output[0]:.3f}, {final_point_output[1]:.3f}, "
+            f"{final_point_output[2]:.3f}] m in {self.output_frame}."
         )
         return DetectionRunResult(
             True,
@@ -652,6 +942,7 @@ class YoloePointedDetectionServiceNode(Node):
         deadline = time.monotonic() + timeout_s
 
         while time.monotonic() < deadline:
+            self._touch_subscription_deadline()
             with self._lock:
                 color = None if self._latest_color_image is None else self._latest_color_image.copy()
                 depth = None if self._latest_depth_image is None else self._latest_depth_image.copy()
@@ -689,7 +980,7 @@ class YoloePointedDetectionServiceNode(Node):
             depth_image = depth_image[:, :, 0]
 
         image_h, image_w = color_image.shape[:2]
-        cues = self._extract_pointing_cues(
+        cues, body_reference = self._extract_pointing_cues(
             image_bgr=color_image,
             width=image_w,
             height=image_h,
@@ -757,6 +1048,7 @@ class YoloePointedDetectionServiceNode(Node):
         selected = self._select_pointed_detection(
             result=result,
             cues=cues,
+            body_reference=body_reference,
             image_w=image_w,
             image_h=image_h,
             depth_image=depth_image,
@@ -823,7 +1115,11 @@ class YoloePointedDetectionServiceNode(Node):
             dtype=np.float64,
         )
         depth_frame = snapshot.depth_frame or snapshot.camera_info.header.frame_id
-        point_in_camera = self._transform_point_to_camera_link(point_in_depth, depth_frame)
+        point_in_camera = self._transform_point_to_frame(
+            point_in_depth,
+            depth_frame,
+            self.camera_link_frame,
+        )
         if point_in_camera is None:
             annotated = self._draw_no_detection_ui(color_image, cues, "Depth->camera TF unavailable")
             return FrameDecision(
@@ -862,12 +1158,13 @@ class YoloePointedDetectionServiceNode(Node):
         height: int,
         depth_image: np.ndarray,
         depth_encoding: str,
-    ) -> list[PointingCue]:
+    ) -> tuple[list[PointingCue], BodyReference | None]:
         rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         hand_result = self._hands.process(rgb)
         pose_result = self._pose.process(rgb)
 
         cues: list[PointingCue] = []
+        body_reference: BodyReference | None = None
 
         if hand_result.multi_hand_landmarks is not None:
             for idx, hand_landmarks in enumerate(hand_result.multi_hand_landmarks):
@@ -907,6 +1204,26 @@ class YoloePointedDetectionServiceNode(Node):
         pose_landmarks = pose_result.pose_landmarks
         if pose_landmarks is not None:
             lm = pose_landmarks.landmark
+            left_shoulder = lm[11]
+            right_shoulder = lm[12]
+            if (
+                float(left_shoulder.visibility) >= self.min_pose_visibility
+                and float(right_shoulder.visibility) >= self.min_pose_visibility
+            ):
+                left_shoulder_uv = self._landmark_to_pixel(left_shoulder, width, height)
+                right_shoulder_uv = self._landmark_to_pixel(right_shoulder, width, height)
+                shoulder_span = float(
+                    np.linalg.norm(
+                        np.array(left_shoulder_uv, dtype=np.float32)
+                        - np.array(right_shoulder_uv, dtype=np.float32)
+                    )
+                )
+                if shoulder_span >= self.min_arm_length_px:
+                    body_reference = BodyReference(
+                        left_shoulder_uv=left_shoulder_uv,
+                        right_shoulder_uv=right_shoulder_uv,
+                    )
+
             side_map = {
                 "left": (11, 13, 15),
                 "right": (12, 14, 16),
@@ -962,7 +1279,7 @@ class YoloePointedDetectionServiceNode(Node):
                     )
                 )
 
-        return cues
+        return cues, body_reference
 
     @staticmethod
     def _is_pointing_gesture(landmarks: Any) -> bool:
@@ -985,6 +1302,7 @@ class YoloePointedDetectionServiceNode(Node):
         self,
         result: Any,
         cues: list[PointingCue],
+        body_reference: BodyReference | None,
         image_w: int,
         image_h: int,
         depth_image: np.ndarray,
@@ -1050,11 +1368,15 @@ class YoloePointedDetectionServiceNode(Node):
 
                 if score < best_score:
                     best_score = score
+                    selected_side = self._classify_target_side((center_u, center_v), body_reference)
+                    if selected_side == "unknown" and cue.side in ("left", "right"):
+                        selected_side = cue.side
                     best = PointedDetection(
                         class_name=class_name,
                         confidence=confidence,
                         box_xyxy=(x1, y1, x2, y2),
                         center_uv=(center_u, center_v),
+                        selected_side=selected_side,
                         cue_source=cue.source,
                         cue_side=cue.side,
                         tip_uv=cue.tip_uv,
@@ -1064,6 +1386,29 @@ class YoloePointedDetectionServiceNode(Node):
                     )
 
         return best
+
+    @staticmethod
+    def _classify_target_side(
+        center_uv: tuple[int, int], body_reference: BodyReference | None
+    ) -> str:
+        if body_reference is None:
+            return "unknown"
+
+        left = np.array(body_reference.left_shoulder_uv, dtype=np.float32)
+        right = np.array(body_reference.right_shoulder_uv, dtype=np.float32)
+        axis = left - right
+        axis_norm = float(np.linalg.norm(axis))
+        if axis_norm < 1e-6:
+            return "unknown"
+
+        midpoint = (left + right) * 0.5
+        lateral = float(
+            np.dot(np.array(center_uv, dtype=np.float32) - midpoint, axis / axis_norm)
+        )
+        deadband = max(12.0, axis_norm * 0.08)
+        if abs(lateral) <= deadband:
+            return "unknown"
+        return "left" if lateral > 0.0 else "right"
 
     @staticmethod
     def _landmark_to_pixel(landmark: Any, width: int, height: int) -> tuple[int, int]:
@@ -1236,7 +1581,7 @@ class YoloePointedDetectionServiceNode(Node):
             annotated,
             (
                 f"Selected: {selected.class_name} {selected.confidence:.2f} "
-                f"({selected.cue_side}/{selected.cue_source})"
+                f"({selected.selected_side}; {selected.cue_side}/{selected.cue_source})"
             ),
             (12, 34),
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -1349,10 +1694,10 @@ class YoloePointedDetectionServiceNode(Node):
     def _publish_tf(self, child_frame: str, translation: np.ndarray) -> None:
         with self._tf_publish_lock:
             self._active_tf_map[child_frame] = PublishedTFEntry(
-                parent_frame=self.camera_link_frame,
+                parent_frame=self.output_frame,
                 translation=translation.copy(),
             )
-        self._send_tf_transform(child_frame, translation, self.camera_link_frame)
+        self._send_tf_transform(child_frame, translation, self.output_frame)
 
     def _send_tf_transform(
         self, child_frame: str, translation: np.ndarray, parent_frame: str
@@ -1367,22 +1712,21 @@ class YoloePointedDetectionServiceNode(Node):
         tf_msg.transform.rotation.w = 1.0
         self._tf_broadcaster.sendTransform(tf_msg)
 
-    def _transform_point_to_camera_link(
-        self, point_in_source: np.ndarray, source_frame: str
+    def _transform_point_to_frame(
+        self, point_in_source: np.ndarray, source_frame: str, target_frame: str
     ) -> np.ndarray | None:
-        if source_frame == self.camera_link_frame or source_frame == "":
+        if source_frame == target_frame or source_frame == "":
             return point_in_source
 
         try:
             transform = self._tf_buffer.lookup_transform(
-                self.camera_link_frame,
+                target_frame,
                 source_frame,
                 Time(),
+                timeout=self._tf_lookup_timeout,
             )
         except TransformException as exc:
-            self.get_logger().warn(
-                f"TF lookup failed ({source_frame} -> {self.camera_link_frame}): {exc}"
-            )
+            self.get_logger().warn(f"TF lookup failed ({source_frame} -> {target_frame}): {exc}")
             return None
 
         rotation = transform.transform.rotation
@@ -1535,6 +1879,7 @@ class YoloePointedDetectionServiceNode(Node):
             return
 
     def destroy_node(self) -> bool:
+        self._unsubscribe_input_streams()
         self._hands.close()
         self._pose.close()
         if self.show_ui and not self._ui_failed:

@@ -534,7 +534,8 @@ class WhisperCommandNode(Node):
         self.declare_parameter("status_topic", "/robot_status")
         self.declare_parameter("status_service", "/robot_status")
         self.declare_parameter("get_command_service", "/get_command")
-        self.declare_parameter("awake_word", "hi eva")
+        self.declare_parameter("awake_word", "hi")
+        self.declare_parameter("awake_words", ["hi"])
         self.declare_parameter("get_command_timeout_sec", 10.0)
         self.declare_parameter("audio_device", "default")
         self.declare_parameter("rate", 16000)
@@ -562,6 +563,8 @@ class WhisperCommandNode(Node):
         self.status_service = str(self.get_parameter("status_service").value)
         self.get_command_service = str(self.get_parameter("get_command_service").value)
         self.awake_word = str(self.get_parameter("awake_word").value).strip().lower()
+        awake_words_value = self.get_parameter("awake_words").value
+        self.awake_words = self._build_awake_words(awake_words_value, self.awake_word)
         self.get_command_timeout_sec = float(self.get_parameter("get_command_timeout_sec").value)
         self.audio_device = str(self.get_parameter("audio_device").value)
         self.rate = int(self.get_parameter("rate").value)
@@ -666,7 +669,7 @@ class WhisperCommandNode(Node):
 
         self.get_logger().info(
             f"Whisper command node ready. get_command={self.get_command_service} "
-            f"awake_word='{self.awake_word}'"
+            f"awake_words={self.awake_words}"
         )
         self.get_logger().info(
             f"extra_site_packages={self.extra_site_packages} isolate_site_packages={self.isolate_site_packages} "
@@ -702,6 +705,25 @@ class WhisperCommandNode(Node):
     def _normalize_text(text: str) -> str:
         cleaned = re.sub(r"[^a-z0-9 ]+", " ", text.lower())
         return " ".join(cleaned.split())
+
+    @classmethod
+    def _build_awake_words(cls, configured_words, legacy_awake_word: str) -> list[str]:
+        words: list[str] = []
+
+        if isinstance(configured_words, (list, tuple)):
+            for value in configured_words:
+                normalized = cls._normalize_text(str(value).strip().lower())
+                if normalized and normalized not in words:
+                    words.append(normalized)
+
+        legacy_normalized = cls._normalize_text(str(legacy_awake_word).strip().lower())
+        if legacy_normalized and legacy_normalized not in words:
+            words.append(legacy_normalized)
+
+        if not words:
+            words = ["hi"]
+
+        return words
 
     def _robot_status_callback(self, msg: String) -> None:
         status = str(msg.data).strip().lower()
@@ -916,12 +938,15 @@ class WhisperCommandNode(Node):
             return
 
         normalized_text = self._normalize_text(cleaned)
-        normalized_awake = self._normalize_text(self.awake_word)
-        if normalized_awake and normalized_awake in normalized_text:
+        matched_awake_word = next(
+            (awake_word for awake_word in self.awake_words if awake_word in normalized_text),
+            "",
+        )
+        if matched_awake_word:
             with self._status_lock:
                 self._wake_word_armed = False
             self.get_logger().info(
-                f"Awake word '{self.awake_word}' detected. Requesting robot status 'idle'."
+                f"Awake word '{matched_awake_word}' detected. Requesting robot status 'idle'."
             )
             self._set_robot_status_async("idle")
 

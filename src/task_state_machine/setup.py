@@ -17,12 +17,16 @@ setup(
     zip_safe=True,
     maintainer="usern",
     maintainer_email="usern@example.com",
-    description="YASMIN ROS 2 receptionist task state machine.",
+    description="YASMIN ROS 2 task state machines.",
     license="Apache-2.0",
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
+            "carry_my_luggage_state_machine_node = task_state_machine.carry_my_luggage_state_machine_node:main",
+            "mock_location_image_service_node = task_state_machine.mock_location_image_service_node:main",
             "receptionist_state_machine_node = task_state_machine.receptionist_state_machine_node:main",
+            "telegram_lost_found_node = task_state_machine.telegram_lost_found_node:main",
+            "telegram_food_drink_state_machine_node = task_state_machine.telegram_food_drink_state_machine_node:main",
         ],
     },
 )

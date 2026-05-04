@@ -9,7 +9,7 @@ def generate_launch_description() -> LaunchDescription:
     coqui_site = "/home/usern/coqui-venv/lib/python3.10/site-packages"
 
     args = [
-        DeclareLaunchArgument("model_path", default_value="/home/usern/Kevin_yolo/yolo26l-seg_bag.pt"),
+        DeclareLaunchArgument("model_path", default_value="/home/usern/Kevin_yolo/best_latest.pt"),
         DeclareLaunchArgument("device", default_value="auto"),
         DeclareLaunchArgument("tf_republish_hz", default_value="10.0"),
         DeclareLaunchArgument("service_name", default_value="/yoloe/detect_pointed_prompt"),

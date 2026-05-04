@@ -15,6 +15,7 @@ from typing import Any, Callable
 import pydot
 import py_trees
 import rclpy
+import requests
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
@@ -24,12 +25,15 @@ from std_msgs.msg import String
 
 from coqui_tts_interfaces.action import SpeakText
 from vlm_interfaces.action import AskNameAndDrink
-from vlm_interfaces.srv import VlmQuery
 
 
 VLM_QUERY_SERVICE = os.environ.get("VLM_QUERY_SERVICE", "/vlm/query")
 GET_COMMAND_SERVICE = os.environ.get("GET_COMMAND_SERVICE", "/get_command")
 SPEAK_ACTION_NAME = os.environ.get("SPEAK_ACTION_NAME", "/coqui_tts/speak")
+OPENAI_API_URL = os.environ.get("OPENAI_API_URL", "https://api.openai.com/v1/responses")
+OPENAI_API_KEY_ENV = os.environ.get("OPENAI_API_KEY_ENV", "OPENAI_API_KEY")
+# Change this line to switch the default OpenAI model for this node.
+OPENAI_MODEL = "gpt-5.5"
 DEFAULT_TEXT_THINK = os.environ.get("DEFAULT_TEXT_THINK", "false").strip().lower() in {
     "1",
     "true",
@@ -60,6 +64,39 @@ SYSTEM_PROMPT = (
     "- if known_name='John', known_drink=null, and input is 'tea', data_text should contain complete=true, continue_conversation=false, name=null, drink='tea', task='Drink', and speech_text should confirm John and tea\n"
     "- if known_name=null, known_drink='beer', and input is 'I am Kelly', data_text should contain complete=true, continue_conversation=false, name='Kelly', drink=null, task='Name', and speech_text should confirm Kelly and beer"
 )
+OPENAI_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "name": "ask_name_and_drink_turn",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "speech_text": {"type": "string"},
+            "data_text": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "complete": {"type": "boolean"},
+                    "continue_conversation": {"type": "boolean"},
+                    "task": {"type": "string", "enum": ["Both", "Name", "Drink", "unknown"]},
+                    "reason": {"type": "string"},
+                    "entities": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "name": {"type": ["string", "null"]},
+                            "drink": {"type": ["string", "null"]},
+                        },
+                        "required": ["name", "drink"],
+                    },
+                },
+                "required": ["complete", "continue_conversation", "task", "reason", "entities"],
+            },
+        },
+        "required": ["speech_text", "data_text"],
+    },
+}
 GENERIC_NAME_VALUES = {"guest", "user", "person", "someone", "visitor"}
 Status = py_trees.common.Status
 
@@ -223,6 +260,11 @@ class AskNameAndDrinkActionNode(Node):
 
         self.declare_parameter("action_name", "/ask_name_and_drink")
         self.declare_parameter("vlm_query_service", VLM_QUERY_SERVICE)
+        self.declare_parameter("openai_api_url", OPENAI_API_URL)
+        self.declare_parameter("openai_api_key_env", OPENAI_API_KEY_ENV)
+        self.declare_parameter("openai_model", OPENAI_MODEL)
+        self.declare_parameter("openai_timeout_sec", SERVICE_TIMEOUT_SEC)
+        self.declare_parameter("openai_max_output_tokens", 384)
         self.declare_parameter("get_command_service", GET_COMMAND_SERVICE)
         self.declare_parameter("speak_action_name", SPEAK_ACTION_NAME)
         self.declare_parameter("service_timeout_sec", SERVICE_TIMEOUT_SEC)
@@ -243,6 +285,11 @@ class AskNameAndDrinkActionNode(Node):
 
         self.action_name = str(self.get_parameter("action_name").value).strip() or "/ask_name_and_drink"
         self.vlm_query_service = str(self.get_parameter("vlm_query_service").value).strip() or VLM_QUERY_SERVICE
+        self.openai_api_url = str(self.get_parameter("openai_api_url").value).strip() or OPENAI_API_URL
+        self.openai_api_key_env = str(self.get_parameter("openai_api_key_env").value).strip() or OPENAI_API_KEY_ENV
+        self.openai_model = str(self.get_parameter("openai_model").value).strip() or OPENAI_MODEL
+        self.openai_timeout_sec = max(1.0, float(self.get_parameter("openai_timeout_sec").value))
+        self.openai_max_output_tokens = max(64, int(self.get_parameter("openai_max_output_tokens").value))
         self.get_command_service = str(self.get_parameter("get_command_service").value).strip() or GET_COMMAND_SERVICE
         self.speak_action_name = str(self.get_parameter("speak_action_name").value).strip() or SPEAK_ACTION_NAME
         self.service_timeout_sec = max(1.0, float(self.get_parameter("service_timeout_sec").value))
@@ -274,11 +321,6 @@ class AskNameAndDrinkActionNode(Node):
         self._visual_note = ""
 
         self._callback_group = ReentrantCallbackGroup()
-        self._vlm_client = self.create_client(
-            VlmQuery,
-            self.vlm_query_service,
-            callback_group=self._callback_group,
-        )
         self._get_command_client = self.create_client(
             Trigger,
             self.get_command_service,
@@ -307,7 +349,7 @@ class AskNameAndDrinkActionNode(Node):
 
         self.get_logger().info(
             f"Ask-name-and-drink action ready on {self.action_name} | "
-            f"vlm_service={self.vlm_query_service} | get_command={self.get_command_service} "
+            f"openai_model={self.openai_model} | get_command={self.get_command_service} "
             f"speak_action={self.speak_action_name} | debug_text_input_mode={self.debug_text_input_mode}"
         )
         self._trace(
@@ -543,14 +585,86 @@ class AskNameAndDrinkActionNode(Node):
             f"- known_drink: {known_drink}\n"
         )
 
-    def _debug_prompt_summary(self, request: VlmQuery.Request, blackboard: AskNameAndDrinkBlackboard) -> str:
+    def _debug_prompt_summary(
+        self,
+        user_text: str,
+        reasoning_mode: str,
+        blackboard: AskNameAndDrinkBlackboard,
+    ) -> str:
         return (
-            "vlm classify request | "
-            f"user_input={str(request.user_input)[:160]!r} "
-            f"reasoning_mode={request.reasoning_mode} "
+            "openai classify request | "
+            f"user_input={user_text[:160]!r} "
+            f"reasoning_mode={reasoning_mode} "
             f"known_name={blackboard.guest_name!r} "
             f"known_drink={blackboard.guest_drink!r}"
         )
+
+    def _openai_api_key(self) -> str:
+        api_key = os.environ.get(self.openai_api_key_env, "").strip()
+        if not api_key:
+            raise RuntimeError(
+                f"OpenAI API key is not set. Export {self.openai_api_key_env} before starting this node."
+            )
+        return api_key
+
+    @staticmethod
+    def _extract_openai_output_text(payload: dict[str, Any]) -> str:
+        direct_text = str(payload.get("output_text") or "").strip()
+        if direct_text:
+            return direct_text
+
+        parts: list[str] = []
+        for item in payload.get("output", []):
+            if not isinstance(item, dict):
+                continue
+            for content in item.get("content", []):
+                if not isinstance(content, dict):
+                    continue
+                if content.get("type") in {"output_text", "text"}:
+                    text = str(content.get("text") or "")
+                    if text:
+                        parts.append(text)
+        return "\n".join(parts).strip()
+
+    def _query_openai_json(self, prompt_text: str, user_text: str) -> dict[str, Any]:
+        payload = {
+            "model": self.openai_model,
+            "instructions": "Return only JSON that matches the requested schema.",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": f"{prompt_text}\nCurrent guest utterance:\n{user_text}",
+                        }
+                    ],
+                }
+            ],
+            "text": {"format": OPENAI_RESPONSE_FORMAT},
+            "max_output_tokens": self.openai_max_output_tokens,
+            "store": False,
+        }
+        response = requests.post(
+            self.openai_api_url,
+            headers={
+                "Authorization": f"Bearer {self._openai_api_key()}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=self.openai_timeout_sec,
+        )
+        if not response.ok:
+            raise RuntimeError(f"OpenAI request failed: HTTP {response.status_code} {response.text[:500]}")
+
+        response_payload = response.json()
+        output_text = self._extract_openai_output_text(response_payload)
+        if not output_text:
+            raise RuntimeError("OpenAI response did not contain output text.")
+        parsed = parse_json_relaxed(output_text)
+        if not isinstance(parsed, dict):
+            raise RuntimeError("OpenAI response JSON is not an object.")
+        return parsed
 
     def _classify_input(
         self,
@@ -558,63 +672,27 @@ class AskNameAndDrinkActionNode(Node):
         think: bool,
         blackboard: AskNameAndDrinkBlackboard,
     ) -> tuple[dict[str, Any], str, float]:
-        if not self._vlm_client.wait_for_service(timeout_sec=1.0):
-            raise RuntimeError(f"VLM query service '{self.vlm_query_service}' not ready.")
-
-        request = VlmQuery.Request()
-        request.need_image = False
-        request.camera_name = ""
-        request.prompt = self._build_contextual_prompt(blackboard)
-        request.reasoning_mode = "thinking" if think else "fast"
-        request.user_input = user_text
-        request.request_profile = "dialogue_text"
-        request.max_retry_count = 0
-        request.json_repair_mode = 1
-        request.num_predict_override = 0
-        request.timeout_sec_override = 0.0
+        prompt_text = self._build_contextual_prompt(blackboard)
+        reasoning_mode = "thinking" if think else "fast"
         if self.trace_log_prompt and self.debug_text_input_mode:
-            self._trace(self._debug_prompt_summary(request, blackboard))
+            self._trace(self._debug_prompt_summary(user_text, reasoning_mode, blackboard))
 
         started = time.time()
-        future = self._vlm_client.call_async(request)
-        ok, response, error_text = self._wait_for_future(future, self.service_timeout_sec)
+        response = self._query_openai_json(prompt_text, user_text)
         elapsed_s = time.time() - started
 
-        if not ok:
-            raise RuntimeError(f"VLM request failed: {error_text}")
-        if response is None:
-            raise RuntimeError("VLM service returned no response")
-        if not response.success:
-            raise RuntimeError(response.message or "VLM service request failed")
-
-        speech_text = str(response.speech_text).strip()
-        data_text = str(response.data_text).strip()
+        speech_text = str(response.get("speech_text") or "").strip()
+        data_text_payload = response.get("data_text")
+        if not isinstance(data_text_payload, dict):
+            raise RuntimeError("OpenAI response data_text is not a JSON object.")
         self._trace(
-            "vlm classify response | "
-            f"reasoning_mode={request.reasoning_mode} "
+            "openai classify response | "
+            f"reasoning_mode={reasoning_mode} "
             f"elapsed_s={elapsed_s:.3f} "
             f"speech_text={speech_text[:200]!r} "
-            f"data_text={data_text[:400]!r}"
+            f"data_text={json.dumps(data_text_payload, ensure_ascii=False)[:400]!r}"
         )
-
-        if data_text:
-            parsed = parse_json_relaxed(data_text)
-            self._trace(
-                "vlm parsed data_text | "
-                f"parsed={json.dumps(parsed, ensure_ascii=False)[:500]}"
-            )
-            return parsed, speech_text, elapsed_s
-        if speech_text:
-            parsed = parse_json_relaxed(speech_text)
-            self._trace(
-                "vlm parsed speech_text fallback | "
-                f"parsed={json.dumps(parsed, ensure_ascii=False)[:500]}"
-            )
-            return parsed, "", elapsed_s
-        raise RuntimeError(
-            "Service returned no usable JSON payload. "
-            f"speech_text={response.speech_text!r} data_text={response.data_text!r}"
-        )
+        return data_text_payload, speech_text, elapsed_s
 
     def _get_command(self) -> str:
         if self.debug_text_input_mode:

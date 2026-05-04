@@ -55,6 +55,7 @@ def main(args: list[str] | None = None) -> None:
         print("message:", response.message)
         print("detections_in_frame:", response.detections_in_frame)
         print("tf_published_count:", response.tf_published_count)
+        print("selected_side:", response.selected_side)
         if response.poses_camera_link:
             pose = response.poses_camera_link[0].pose.position
             cls = response.detected_classes[0] if response.detected_classes else "unknown"

@@ -25,6 +25,8 @@ setup(
         'console_scripts': [
             'deepsort_people_follow_node = deepsort_people_follow.deepsort_people_follow_node:main',
             'people_follow_nav2_bridge = deepsort_people_follow.people_follow_nav2_bridge:main',
+            'people_follow_cmd_vel = deepsort_people_follow.people_follow_cmd_vel:main',
+            'people_follow_target_filter = deepsort_people_follow.people_follow_target_filter:main',
         ],
     },
 )

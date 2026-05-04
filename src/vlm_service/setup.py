@@ -24,6 +24,8 @@ setup(
         'console_scripts': [
             'vlm_query_service_node = vlm_service.vlm_query_service_node:main',
             'camera_snapshot_service_node = vlm_service.camera_snapshot_service_node:main',
+            'lost_found_vlm_check_node = vlm_service.lost_found_vlm_check_node:main',
+            'food_drink_sort_service_node = vlm_service.food_drink_sort_service_node:main',
             'ask_name_and_drink_action_node = vlm_service.ask_name_and_drink_action_node:main',
             'describe_human_from_camera0_node = vlm_service.describe_human_from_camera0_node:main',
             'describe_human_action_node = vlm_service.describe_human_action_node:main',

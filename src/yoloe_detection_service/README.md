@@ -12,7 +12,7 @@ Request:
 ```text
 string prompt_text   # e.g. "bottle" or "cup,bottle"
 bool save_image
-string camera_name   # optional: "camera0" or "camera"; empty uses server default
+string camera_name   # optional: "camera0" or "gripper_camera"; empty uses server default
 ```
 
 Response includes arrays with at most one valid detection: the highest-confidence detection
@@ -20,7 +20,7 @@ that also has valid depth/TF:
 
 - `detected_classes[]`
 - `confidences[]`
-- `poses_camera_link[]`
+- `poses_camera_link[]` with `header.frame_id` set to the configured final output frame
 - `tf_child_frames[]` (e.g. `chair_1`)
 
 The service definition still uses arrays, but only index `0` is populated when a valid result
@@ -30,7 +30,7 @@ is available. The response also includes `detections_in_frame`, `tf_published_co
 Model behavior:
 
 - Default model path is `/home/usern/yoloe-26l-seg.pt`.
-- Bag-specific model path is `/home/usern/Kevin_yolo/yolo26l-seg_bag.pt`.
+- Bag-specific model path is `/home/usern/Kevin_yolo/best_latest.pt`.
 - Bag-only prompts such as `bag`, `paper bag`, and `brown paper bag` temporarily switch to
   the bag-specific model for that request, then unload it after detection.
 - All other prompts stay on the default YOLOE model.
@@ -43,9 +43,10 @@ Model behavior:
 - `camera0` color: `/camera0/color/image_raw`
 - `camera0` depth: `/camera0/realsense_splitter_node/output/depth`
 - `camera0` camera info: `/camera0/color/camera_info`
-- `camera` color: `/camera/color/image_raw`
-- `camera` depth: `/camera/depth/image_raw`
-- `camera` camera info: `/camera/color/camera_info`
+- `gripper_camera` color: `/gripper_camera/color/image_raw`
+- `gripper_camera` depth: `/gripper_camera/depth/image_raw`
+- `gripper_camera` camera info: `/gripper_camera/color/camera_info`
+- Final published pose/TF frame: `base_link`
 
 ## Build
 
@@ -80,10 +81,10 @@ source /home/usern/robocup_ws/install/setup.bash
 ros2 service call /yoloe/detect_prompt yoloe_detection_interfaces/srv/DetectObjectPrompt "{prompt_text: 'bottle', save_image: true, camera_name: 'camera0'}"
 ```
 
-Use the Orbbec DaBai stream:
+Use the gripper camera stream:
 
 ```bash
-ros2 service call /yoloe/detect_prompt yoloe_detection_interfaces/srv/DetectObjectPrompt "{prompt_text: 'bottle', save_image: true, camera_name: 'camera'}"
+ros2 service call /yoloe/detect_prompt yoloe_detection_interfaces/srv/DetectObjectPrompt "{prompt_text: 'bottle', save_image: true, camera_name: 'gripper_camera'}"
 ```
 
 Tracking service `/yoloe/set_tracking` is now provided by the `deepstream_people_tracking` package.
@@ -97,7 +98,7 @@ Behavior:
 
 - One inference per service request.
 - Uses MediaPipe hand landmarks to detect left/right pointing gesture.
-- Uses the paper bag model `/home/usern/Kevin_yolo/yolo26l-seg_bag.pt`.
+- Uses the paper bag model `/home/usern/Kevin_yolo/best_latest.pt`.
 - Accepts bag-only prompts such as `bag`, `paper bag`, or `brown paper bag`.
 - Returns only the object aligned with pointing ray (single centroid pose in `poses_camera_link[0]`).
 - Republishes the last successful TF continuously until the same child frame is updated by a

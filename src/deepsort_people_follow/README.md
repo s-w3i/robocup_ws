@@ -77,6 +77,7 @@ Default runtime now uses:
 - `enable_ui:=true`
 - `launch_nav2_bridge:=true`
 - `nav2_bridge_enabled:=false`
+- `nav2_bridge_goal_command_mode:=goal_pose`
 
 Example override with ROS parameters:
 
@@ -124,9 +125,9 @@ If you are running your normal Nav2 stack from Wheeltec bringup and only want to
 This bridge:
 
 - Looks up `map -> follow_target`
-- Starts a `NavigateToPose` goal with the local BT at `bt/follower_w_recovery.xml`
+- Publishes follow goals on `/goal_pose` for the running Nav2 stack
 - Publishes transformed target updates on `/goal_update`
-- Cancels its follow goal when disabled so normal navigation can resume
+- Publishes a one-shot hold goal on disable so normal navigation can resume cleanly
 
 Enable follow mode:
 

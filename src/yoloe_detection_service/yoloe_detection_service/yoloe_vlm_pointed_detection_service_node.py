@@ -32,6 +32,7 @@ from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformL
 
 from yoloe_detection_interfaces.srv import DetectObjectPrompt
 from yoloe_detection_service.yoloe_detection_service_node import (
+    configure_ultralytics_text_asset_resolution,
     ensure_torch_runtime_libs,
     preload_cupti_if_needed,
 )
@@ -308,6 +309,10 @@ class YoloeVlmPointedDetectionServiceNode(Node):
         started = time.perf_counter()
         self._model = YOLOE(self.model_path)
         elapsed_s = time.perf_counter() - started
+        resolved_assets = configure_ultralytics_text_asset_resolution()
+        asset_path = resolved_assets.get("mobileclip2_b.ts")
+        if asset_path is not None:
+            self.get_logger().info(f"Resolved MobileCLIP asset: {asset_path}")
         self.get_logger().info(f"Loaded YOLOE model in {elapsed_s:.2f}s")
         self.get_logger().info(f"Torch CUDA available: {torch.cuda.is_available()}")
 
@@ -380,6 +385,7 @@ class YoloeVlmPointedDetectionServiceNode(Node):
         response.confidences = []
         response.poses_camera_link = []
         response.tf_child_frames = []
+        response.selected_side = ""
         response.saved_image_path = ""
         response.detections_in_frame = 0
         response.tf_published_count = 0

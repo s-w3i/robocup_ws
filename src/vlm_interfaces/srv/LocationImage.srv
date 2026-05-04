@@ -1,0 +1,10 @@
+string session_id
+string object_name
+string location_name
+int32 location_index
+string original_query
+---
+bool success
+string message
+string camera_name
+string image_path

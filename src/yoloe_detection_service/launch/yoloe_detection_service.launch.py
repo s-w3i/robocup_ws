@@ -8,7 +8,7 @@ def generate_launch_description() -> LaunchDescription:
     default_site_packages = "/home/usern/coqui-venv/lib/python3.10/site-packages"
     args = [
         DeclareLaunchArgument("model_path", default_value="/home/usern/yoloe-26l-seg.pt"),
-        DeclareLaunchArgument("bag_model_path", default_value="/home/usern/Kevin_yolo/yolo26l-seg_bag.pt"),
+        DeclareLaunchArgument("bag_model_path", default_value="/home/usern/Kevin_yolo/best_latest.pt"),
         DeclareLaunchArgument("device", default_value="auto"),
         DeclareLaunchArgument("service_name", default_value="/yoloe/detect_prompt"),
         DeclareLaunchArgument("default_camera_name", default_value="camera0"),
@@ -20,10 +20,10 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("camera0_depth_topic", default_value=""),
         DeclareLaunchArgument("camera0_camera_info_topic", default_value=""),
         DeclareLaunchArgument("camera0_camera_link_frame", default_value=""),
-        DeclareLaunchArgument("camera_color_topic", default_value="/camera/color/image_raw"),
-        DeclareLaunchArgument("camera_depth_topic", default_value="/camera/depth/image_raw"),
-        DeclareLaunchArgument("camera_camera_info_topic", default_value="/camera/color/camera_info"),
-        DeclareLaunchArgument("camera_camera_link_frame", default_value="camera_link"),
+        DeclareLaunchArgument("camera_color_topic", default_value="/gripper_camera/color/image_raw"),
+        DeclareLaunchArgument("camera_depth_topic", default_value="/gripper_camera/depth/image_raw"),
+        DeclareLaunchArgument("camera_camera_info_topic", default_value="/gripper_camera/color/camera_info"),
+        DeclareLaunchArgument("camera_camera_link_frame", default_value="gripper_camera_link"),
         DeclareLaunchArgument("save_dir", default_value="/home/usern/robocup_ws/yoloe_out"),
         DeclareLaunchArgument("always_save_image", default_value="false"),
         DeclareLaunchArgument("python_site_packages", default_value=default_site_packages),

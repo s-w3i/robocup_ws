@@ -1,0 +1,9 @@
+string chat_id
+string question
+string object_name
+string camera_name
+string image_path
+float32 confidence_threshold
+---
+bool accepted
+string message

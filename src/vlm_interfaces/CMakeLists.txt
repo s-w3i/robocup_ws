@@ -12,6 +12,12 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/AskNameAndDrink.action"
   "action/DescribeHuman.action"
   "srv/CaptureImage.srv"
+  "srv/FoodDrinkSort.srv"
+  "srv/LocationImage.srv"
+  "srv/LostFoundVlmCheck.srv"
+  "srv/TelegramReply.srv"
+  "srv/TelegramVisualSearch.srv"
+  "srv/VisualQuestion.srv"
   "srv/VlmQuery.srv"
 )
 
